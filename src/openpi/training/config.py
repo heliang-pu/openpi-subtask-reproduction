@@ -298,6 +298,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    # When True, uses TokenizeSubtaskInference (prefix-only prompt) instead of
+    # the default model transforms, enabling autoregressive subtask generation
+    # at inference time.  Leave False for training.
+    subtask_inference: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -353,9 +357,18 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        # Model transforms include things like tokenizing the prompt and action targets
-        # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory()(model_config)
+        if self.subtask_inference:
+            model_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeSubtaskInference(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ],
+            )
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -813,6 +826,22 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Inference-only config for pi0.5 subtask generation on LIBERO.
+    # Uses TokenizeSubtaskInference (prefix-only prompt) so that the model
+    # autoregressively generates subtask tokens before action generation.
+    # Point --policy.dir to a trained pi05_subtask_libero checkpoint.
+    TrainConfig(
+        name="pi05_subtask_libero_infer",
+        model=pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            subtask_inference=True,
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),

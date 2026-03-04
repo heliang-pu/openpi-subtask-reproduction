@@ -89,6 +89,22 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+
+        # Pi0.5 two-stage inference: generate subtask then sample actions.
+        # Triggered when: (a) model supports it, (b) JAX model, (c) no pre-filled subtask.
+        subtask_text = None
+        if (
+            not self._is_pytorch_model
+            and hasattr(self._model, "generate_subtask")
+            and observation.token_ar_mask is None
+        ):
+            subtask_tokens = self._model.generate_subtask(observation)
+            observation = self._model.build_full_observation(observation, subtask_tokens)
+            gen_len = subtask_tokens.shape[1]
+            tok = _tokenizer.PaligemmaTokenizer(max_len=200)
+            subtask_text = tok.detokenize(np.asarray(subtask_tokens[0]))
+            logging.info(f"Subtask ({gen_len} tokens): {subtask_text}")
+
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
@@ -104,6 +120,8 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if subtask_text is not None:
+            outputs["generated_subtask"] = subtask_text
         return outputs
 
     @property

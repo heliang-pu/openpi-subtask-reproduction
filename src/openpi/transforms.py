@@ -301,6 +301,31 @@ class TokenizeSubtaskTraining(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskInference(DataTransformFn):
+    """Tokenize only the high-level prefix for pi0.5 subtask inference.
+
+    Produces "Task: X. Subtask: " with padding — the model will
+    autoregressively generate the subtask tokens during inference.
+    Does NOT produce token_ar_mask or token_loss_mask (inference-only).
+    """
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required for subtask inference")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+
+        tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt)
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 

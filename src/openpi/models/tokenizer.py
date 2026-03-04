@@ -116,6 +116,42 @@ class PaligemmaTokenizer:
             np.asarray(loss_mask_list, dtype=np.bool_),
         )
 
+    def tokenize_high_level_prefix(self, high_prompt: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize only the high-level prefix for subtask inference.
+
+        Produces: [BOS] "Task: <high>. Subtask: " [PAD...]
+        The model will autoregressively complete the subtask at inference time.
+
+        Returns:
+            tokens: int32[max_len]
+            mask:   bool[max_len] — True for real tokens, False for padding.
+        """
+        cleaned_high = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        if cleaned_high and cleaned_high[-1] in string.punctuation:
+            cleaned_high = cleaned_high[:-1]
+        prefix_str = f"Task: {cleaned_high}. Subtask: "
+        tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            pad_len = self._max_len - tokens_len
+            mask = [True] * tokens_len + [False] * pad_len
+            tokens = tokens + [0] * pad_len
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Prefix token length ({tokens_len}) exceeds max ({self._max_len}), truncating."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=np.bool_)
+
+    def detokenize(self, tokens: np.ndarray) -> str:
+        """Decode token IDs back to text, skipping padding (0) and EOS (1)."""
+        valid = [int(t) for t in tokens if t != 0 and t != PALIGEMMA_EOS_TOKEN]
+        return self._tokenizer.decode(valid)
+
 
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):

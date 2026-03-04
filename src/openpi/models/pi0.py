@@ -390,3 +390,135 @@ class Pi05Subtask(Pi0):
             subtask_loss = jnp.zeros(B)
 
         return subtask_loss[:, None] + flow_loss
+
+    def generate_subtask(
+        self,
+        observation: _model.Observation,
+        *,
+        max_tokens: int = 50,
+    ) -> jnp.ndarray:
+        """Stage 1 of pi0.5 inference: autoregressively generate subtask tokens.
+
+        Uses greedy decoding (argmax). Runs in eager Python (not JIT) because
+        the loop length is dynamic and KV cache grows each step.
+
+        Args:
+            observation: Batched observation with prefix-only tokenized_prompt.
+            max_tokens: Maximum number of subtask tokens to generate.
+
+        Returns:
+            int32[B, gen_len] — generated token IDs including EOS.
+        """
+        observation = jax.tree.map(jnp.asarray, observation)
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+
+        B = prefix_tokens.shape[0]
+        prefix_S = prefix_tokens.shape[1]
+
+        # Find the actual last real token INDEX in the sequence (not count-based).
+        # sum(mask) is wrong as an index when masked-out regions (e.g. unused camera)
+        # sit before real text tokens.
+        seq_indices = jnp.arange(prefix_S)[None, :]  # [1, S]
+        last_pos = jnp.max(
+            jnp.where(prefix_mask, seq_indices, -1), axis=1
+        ).astype(jnp.int32)  # [B]
+        last_hidden = prefix_out[jnp.arange(B), last_pos, :]  # [B, d]
+        logits = self.PaliGemma.llm(
+            last_hidden[:, None, :], method="decode_to_logits"
+        )  # [B, 1, V]
+
+        generated: list[jnp.ndarray] = []
+        # Position encoding uses cumulative count (not sequence index).
+        num_real = jnp.sum(prefix_mask, axis=1)
+        next_pos = num_real.astype(jnp.int32)  # [B]
+
+        for i in range(max_tokens):
+            next_token = jnp.argmax(logits[:, -1, :], axis=-1)  # [B]
+            generated.append(next_token)
+
+            if jnp.all(next_token == PALIGEMMA_EOS_TOKEN):
+                break
+
+            next_emb = self.PaliGemma.llm(
+                next_token[:, None], method="embed"
+            )  # [B, 1, d]
+
+            gen_count = i + 1
+            gen_mask = jnp.ones((B, gen_count), dtype=jnp.bool_)
+            full_mask = jnp.concatenate(
+                [prefix_mask, gen_mask], axis=1
+            )  # [B, prefix_S + gen_count]
+            attn_mask = full_mask[:, None, :]  # [B, 1, prefix_S + gen_count]
+
+            new_positions = next_pos[:, None]  # [B, 1]
+
+            (new_out, _), kv_cache = self.PaliGemma.llm(
+                [next_emb, None],
+                mask=attn_mask,
+                positions=new_positions,
+                kv_cache=kv_cache,
+            )
+
+            logits = self.PaliGemma.llm(
+                new_out, method="decode_to_logits"
+            )  # [B, 1, V]
+            next_pos = next_pos + 1
+
+        if not generated:
+            return jnp.zeros((B, 0), dtype=jnp.int32)
+        return jnp.stack(generated, axis=1)  # [B, gen_len]
+
+    def build_full_observation(
+        self,
+        observation: _model.Observation,
+        subtask_tokens: jnp.ndarray,
+    ) -> _model.Observation:
+        """Insert generated subtask tokens into the padded prompt for Stage 2.
+
+        The original prompt is "Task: X. Subtask: [PAD...]". This method fills
+        the padding region with the generated subtask tokens so that
+        sample_actions sees the complete prompt.
+
+        Args:
+            observation: Original observation with prefix-only prompt.
+            subtask_tokens: int32[B, gen_len] from generate_subtask.
+
+        Returns:
+            New Observation with updated tokenized_prompt and mask.
+        """
+        observation = jax.tree.map(jnp.asarray, observation)
+        B, max_len = observation.tokenized_prompt.shape
+        gen_len = subtask_tokens.shape[1]
+
+        if gen_len == 0:
+            return observation
+
+        prefix_len = jnp.sum(
+            observation.tokenized_prompt_mask, axis=1
+        )  # [B]
+
+        idx = jnp.arange(max_len)[None, :]  # [1, max_len]
+        offset = idx - prefix_len[:, None]  # [B, max_len]
+        in_gen = (offset >= 0) & (offset < gen_len)  # [B, max_len]
+        offset_clamped = jnp.clip(offset, 0, gen_len - 1).astype(jnp.int32)
+        gen_vals = subtask_tokens[
+            jnp.arange(B)[:, None], offset_clamped
+        ]  # [B, max_len]
+
+        new_tokens = jnp.where(in_gen, gen_vals, observation.tokenized_prompt)
+        new_mask = observation.tokenized_prompt_mask | in_gen
+
+        return _model.Observation(
+            images=observation.images,
+            image_masks=observation.image_masks,
+            state=observation.state,
+            tokenized_prompt=new_tokens,
+            tokenized_prompt_mask=new_mask,
+        )
