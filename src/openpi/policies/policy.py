@@ -104,6 +104,19 @@ class Policy(BasePolicy):
         # Stage 1 (generate_subtask) is expensive (~25-50s in eager mode).
         # The subtask depends only on the prompt, not on images/state, so we
         # cache it by prompt string and reuse across calls with the same prompt.
+        """
+        进入 infer
+        → 先取出 raw_prompt（74–77 行，在 transform 前取，避免被改掉）
+        → 若满足：JAX 模型 + 有 generate_subtask + observation 没有 token_ar_mask（即走「先生成 subtask 再生成 action」的流程）
+            → 若 当前 raw_prompt == _cached_subtask_prompt 且 _cached_subtask_tokens 非空
+                → 命中：直接用缓存的 subtask_tokens / subtask_text，不打 generate_subtask
+            → 否则
+                → 未命中：调用 generate_subtask(observation)，得到 subtask_tokens
+                → 用 tokenizer 把 subtask_tokens 转成 subtask_text（打 log 用）
+                → 更新缓存：_cached_subtask_prompt = raw_prompt，_cached_subtask_tokens/text = 新结果
+        → 无论命中与否，都用当前的 subtask_tokens 调用 build_full_observation(observation, subtask_tokens)
+        → 后面用这个完整 observation 做 sample_actions
+        """
         subtask_text = None
         if (
             not self._is_pytorch_model
@@ -166,10 +179,4 @@ class PolicyRecorder(_base_policy.BasePolicy):
         results = self._policy.infer(obs)
 
         data = {"inputs": obs, "outputs": results}
-        data = flax.traverse_util.flatten_dict(data, sep="/")
-
-        output_path = self._record_dir / f"step_{self._record_step}"
-        self._record_step += 1
-
-        np.save(output_path, np.asarray(data))
-        return results
+        data = flax.traverse_u

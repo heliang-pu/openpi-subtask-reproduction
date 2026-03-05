@@ -130,6 +130,8 @@ def eval_libero(args: Args) -> None:
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
+                    # TODO 目前的 prompt -> action 逻辑是生成一次 prompt，之后的action就围绕这个 prompt 进行生成
+                    # 之后如果有 prompt -> subtask -> action，且需要 subtask 逐步注入并指导 action 的生成，需要修改这边的逻辑
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
