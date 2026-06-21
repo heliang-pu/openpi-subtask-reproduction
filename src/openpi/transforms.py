@@ -270,13 +270,13 @@ class TokenizePrompt(DataTransformFn):
 class TokenizeSubtaskTraining(DataTransformFn):
     """Tokenize prompt for pi0.5 subtask training (joint CE + flow-matching loss).
 
-    Uses identity subtask by default: high_prompt = low_prompt = prompt.
+    Uses data["subtask"] as the low-level target when present, otherwise falls
+    back to identity subtask: high_prompt = low_prompt = prompt.
     Produces token_ar_mask (causal on subtask portion) and token_loss_mask
     (CE loss on subtask portion only).
-
-    Replace the high/low split logic here to plug in real subtask annotations.
     """
     tokenizer: _tokenizer.PaligemmaTokenizer
+    discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         prompt = data.pop("prompt", None)
@@ -285,12 +285,22 @@ class TokenizeSubtaskTraining(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        # --- Identity subtask: high = low = prompt ---
-        # Swap in real subtask annotations here when available.
-        high_prompt = prompt
-        low_prompt = prompt
+        subtask = data.pop("subtask", None)
+        if subtask is not None and not isinstance(subtask, str):
+            subtask = subtask.item()
 
-        tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(high_prompt, low_prompt)
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
+        high_prompt = prompt
+        low_prompt = subtask if subtask is not None else prompt
+
+        tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(
+            high_prompt, low_prompt, state=state
+        )
         return {
             **data,
             "tokenized_prompt": tokens,
@@ -309,6 +319,7 @@ class TokenizeSubtaskInference(DataTransformFn):
     Does NOT produce token_ar_mask or token_loss_mask (inference-only).
     """
     tokenizer: _tokenizer.PaligemmaTokenizer
+    discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         prompt = data.pop("prompt", None)
@@ -317,7 +328,13 @@ class TokenizeSubtaskInference(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt)
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
+        tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt, state=state)
         return {
             **data,
             "tokenized_prompt": tokens,

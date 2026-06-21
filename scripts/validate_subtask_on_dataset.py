@@ -49,7 +49,10 @@ def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> di
         *data_config.data_transforms.inputs,
         _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
         _transforms.ResizeImages(224, 224),
-        _transforms.TokenizeSubtaskInference(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+        _transforms.TokenizeSubtaskInference(
+            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+            discrete_state_input=model_config.discrete_state_input,
+        ),
         _transforms.PadStatesAndActions(model_config.action_dim),
     ]
     for transform in transforms:
@@ -62,7 +65,7 @@ def main() -> None:
     parser.add_argument("--config-name", default="pi05_subtask_pickup_round1_50ep_lora")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--indices", default="0,100,500")
-    parser.add_argument("--max-tokens", type=int, default=30)
+    parser.add_argument("--max-tokens", type=int, default=64)
     args = parser.parse_args()
 
     train_config = _config.get_config(args.config_name)
@@ -86,12 +89,14 @@ def main() -> None:
         tokens = model.generate_subtask(observation, max_tokens=args.max_tokens)
         token_ids = np.asarray(tokens[0])
         generated = tokenizer.detokenize(token_ids)
+        hit_max_tokens = len(token_ids) >= args.max_tokens and _tokenizer.PALIGEMMA_EOS_TOKEN not in token_ids
 
         print("\n" + "=" * 80)
         print(f"index:     {index}")
         print(f"prompt:    {prompt}")
         print(f"gt:        {gt_subtask}")
         print(f"generated: {generated}")
+        print(f"tokens:    count={len(token_ids)} hit_max_tokens={hit_max_tokens}")
         print(f"token_ids: {token_ids.tolist()}")
     print("=" * 80)
 

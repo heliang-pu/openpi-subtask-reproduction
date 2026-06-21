@@ -50,7 +50,10 @@ def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> di
         *data_config.data_transforms.inputs,
         _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
         _transforms.ResizeImages(224, 224),
-        _transforms.TokenizeSubtaskInference(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+        _transforms.TokenizeSubtaskInference(
+            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+            discrete_state_input=model_config.discrete_state_input,
+        ),
         _transforms.PadStatesAndActions(model_config.action_dim),
     ]
     for transform in transforms:
@@ -141,7 +144,7 @@ def main() -> None:
     parser.add_argument("--output", default="outputs/subtask_episode_timeline.png")
     parser.add_argument("--episode", type=int, default=None)
     parser.add_argument("--seconds-stride", type=float, default=1.0)
-    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
 

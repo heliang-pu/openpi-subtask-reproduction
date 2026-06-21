@@ -23,13 +23,32 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    @staticmethod
+    def _clean_text(prompt: str, *, lowercase: bool = False, strip_terminal_punctuation: bool = False) -> str:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if lowercase:
+            cleaned_text = cleaned_text.lower()
+        if strip_terminal_punctuation and cleaned_text and cleaned_text[-1] in string.punctuation:
+            cleaned_text = cleaned_text[:-1]
+        return cleaned_text
+
+    @staticmethod
+    def _format_discretized_state(state: np.ndarray) -> str:
+        # Same discretization convention as pi0.5 action tokenization: normalized state in [-1, 1] -> 256 bins.
+        discretized_state = np.digitize(np.asarray(state), bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        return " ".join(map(str, discretized_state.reshape(-1)))
+
+    def _format_subtask_prefix(self, high_prompt: str, state: np.ndarray | None = None) -> str:
+        cleaned_high = self._clean_text(high_prompt, lowercase=True, strip_terminal_punctuation=True)
+        if state is None:
+            return f"Task: {cleaned_high}. Subtask: "
+        return f"Task: {cleaned_high}, State: {self._format_discretized_state(state)};\nSubtask: "
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        cleaned_text = self._clean_text(prompt)
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
-            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-            state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            full_prompt = f"Task: {cleaned_text}, State: {self._format_discretized_state(state)};\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
@@ -53,12 +72,14 @@ class PaligemmaTokenizer:
 
 
     def tokenize_high_low_prompt(
-        self, high_prompt: str, low_prompt: str
+        self, high_prompt: str, low_prompt: str, state: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Tokenize a high-level + low-level prompt pair for subtask training.
 
         Produces the combined token sequence:
             [BOS] "Task: <high>. Subtask: " <low> [EOS] [PAD...]
+        or, when state is provided:
+            [BOS] "Task: <high>, State: <discretized_state>;\nSubtask: " <low> [EOS] [PAD...]
 
         AR mask:  0 (bidirectional) for the prefix, 1 (causal) for the subtask + EOS.
         Loss mask: False for the prefix, True for the subtask + EOS.
@@ -66,6 +87,7 @@ class PaligemmaTokenizer:
         Args:
             high_prompt: High-level task instruction.
             low_prompt:  Low-level subtask instruction (= high_prompt for identity subtask).
+            state: Optional normalized robot state to discretize into the language prefix.
 
         Returns:
             tokens:    int32[max_len]
@@ -73,15 +95,10 @@ class PaligemmaTokenizer:
             ar_mask:   int32[max_len]  — 0 = bidirectional, 1 = causal.
             loss_mask: bool[max_len]   — True where CE loss is applied.
         """
-        cleaned_high = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
-        if cleaned_high and cleaned_high[-1] in string.punctuation:
-            cleaned_high = cleaned_high[:-1]
-        prefix_str = f"Task: {cleaned_high}. Subtask: "
+        prefix_str = self._format_subtask_prefix(high_prompt, state)
         prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
 
-        cleaned_low = low_prompt.lower().strip().replace("_", " ").replace("\n", " ")
-        if cleaned_low and cleaned_low[-1] in string.punctuation:
-            cleaned_low = cleaned_low[:-1]
+        cleaned_low = self._clean_text(low_prompt, lowercase=True, strip_terminal_punctuation=True)
         suffix_tokens = self._tokenizer.encode(cleaned_low) + [PALIGEMMA_EOS_TOKEN]
 
         all_tokens = prefix_tokens + suffix_tokens
@@ -116,20 +133,21 @@ class PaligemmaTokenizer:
             np.asarray(loss_mask_list, dtype=np.bool_),
         )
 
-    def tokenize_high_level_prefix(self, high_prompt: str) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize_high_level_prefix(
+        self, high_prompt: str, state: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Tokenize only the high-level prefix for subtask inference.
 
         Produces: [BOS] "Task: <high>. Subtask: " [PAD...]
+        or, when state is provided:
+            [BOS] "Task: <high>, State: <discretized_state>;\nSubtask: " [PAD...]
         The model will autoregressively complete the subtask at inference time.
 
         Returns:
             tokens: int32[max_len]
             mask:   bool[max_len] — True for real tokens, False for padding.
         """
-        cleaned_high = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
-        if cleaned_high and cleaned_high[-1] in string.punctuation:
-            cleaned_high = cleaned_high[:-1]
-        prefix_str = f"Task: {cleaned_high}. Subtask: "
+        prefix_str = self._format_subtask_prefix(high_prompt, state)
         tokens = self._tokenizer.encode(prefix_str, add_bos=True)
 
         tokens_len = len(tokens)

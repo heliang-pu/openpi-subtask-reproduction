@@ -5,6 +5,25 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.transforms as _transforms
 
 
+class _RecordingSubtaskTokenizer:
+    def __init__(self):
+        self.training_calls = []
+        self.inference_calls = []
+
+    def tokenize_high_low_prompt(self, high_prompt, low_prompt, state=None):
+        self.training_calls.append((high_prompt, low_prompt, state))
+        return (
+            np.asarray([1, 2, 3], dtype=np.int32),
+            np.asarray([True, True, True]),
+            np.asarray([0, 1, 1], dtype=np.int32),
+            np.asarray([False, True, True]),
+        )
+
+    def tokenize_high_level_prefix(self, high_prompt, state=None):
+        self.inference_calls.append((high_prompt, state))
+        return np.asarray([1, 2, 0], dtype=np.int32), np.asarray([True, True, False])
+
+
 def test_repack_transform():
     transform = _transforms.RepackTransform(
         structure={
@@ -83,6 +102,53 @@ def test_tokenize_no_prompt():
 
     with pytest.raises(ValueError, match="Prompt is required"):
         transform({})
+
+
+def test_tokenize_subtask_training_uses_subtask_and_state():
+    tokenizer = _RecordingSubtaskTokenizer()
+    transform = _transforms.TokenizeSubtaskTraining(tokenizer, discrete_state_input=True)
+    state = np.asarray([0.1, -0.2], dtype=np.float32)
+
+    data = transform({"prompt": "Pick up object", "subtask": "move to object", "state": state})
+
+    high_prompt, low_prompt, recorded_state = tokenizer.training_calls[0]
+    assert high_prompt == "Pick up object"
+    assert low_prompt == "move to object"
+    assert recorded_state is state
+    assert "subtask" not in data
+    assert np.all(data["tokenized_prompt"] == np.asarray([1, 2, 3]))
+    assert np.all(data["token_ar_mask"] == np.asarray([0, 1, 1]))
+    assert np.all(data["token_loss_mask"] == np.asarray([False, True, True]))
+
+
+def test_tokenize_subtask_training_requires_state_when_enabled():
+    tokenizer = _RecordingSubtaskTokenizer()
+    transform = _transforms.TokenizeSubtaskTraining(tokenizer, discrete_state_input=True)
+
+    with pytest.raises(ValueError, match="State is required"):
+        transform({"prompt": "Pick up object", "subtask": "move to object"})
+
+
+def test_tokenize_subtask_inference_uses_state():
+    tokenizer = _RecordingSubtaskTokenizer()
+    transform = _transforms.TokenizeSubtaskInference(tokenizer, discrete_state_input=True)
+    state = np.asarray([0.1, -0.2], dtype=np.float32)
+
+    data = transform({"prompt": "Pick up object", "state": state})
+
+    high_prompt, recorded_state = tokenizer.inference_calls[0]
+    assert high_prompt == "Pick up object"
+    assert recorded_state is state
+    assert np.all(data["tokenized_prompt"] == np.asarray([1, 2, 0]))
+    assert np.all(data["tokenized_prompt_mask"] == np.asarray([True, True, False]))
+
+
+def test_tokenize_subtask_inference_requires_state_when_enabled():
+    tokenizer = _RecordingSubtaskTokenizer()
+    transform = _transforms.TokenizeSubtaskInference(tokenizer, discrete_state_input=True)
+
+    with pytest.raises(ValueError, match="State is required"):
+        transform({"prompt": "Pick up object"})
 
 
 def test_transform_dict():

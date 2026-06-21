@@ -51,7 +51,10 @@ def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> di
         *data_config.data_transforms.inputs,
         _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
         _transforms.ResizeImages(224, 224),
-        _transforms.TokenizeSubtaskInference(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+        _transforms.TokenizeSubtaskInference(
+            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+            discrete_state_input=model_config.discrete_state_input,
+        ),
         _transforms.PadStatesAndActions(model_config.action_dim),
     ]
     for transform in transforms:
@@ -198,7 +201,7 @@ def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -
     _draw_wrapped(
         draw,
         (text_x, text_y),
-        "Raw state present in sample; current subtask checkpoint does not tokenize state.",
+        "State is included in the subtask prefix when discrete_state_input=True.",
         small_font,
         (100, 116, 139),
         68,
@@ -216,7 +219,7 @@ def main() -> None:
     parser.add_argument("--contains-index", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--fps", type=float, default=2.0)
-    parser.add_argument("--max-tokens", type=int, default=24)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
 

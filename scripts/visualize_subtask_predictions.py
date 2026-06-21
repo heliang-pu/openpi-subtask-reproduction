@@ -51,7 +51,10 @@ def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> di
         *data_config.data_transforms.inputs,
         _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
         _transforms.ResizeImages(224, 224),
-        _transforms.TokenizeSubtaskInference(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+        _transforms.TokenizeSubtaskInference(
+            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+            discrete_state_input=model_config.discrete_state_input,
+        ),
         _transforms.PadStatesAndActions(model_config.action_dim),
     ]
     for transform in transforms:
@@ -124,7 +127,7 @@ def main() -> None:
     parser.add_argument("--output", default="outputs/subtask_prediction_episode.png")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--num-frames", type=int, default=4)
-    parser.add_argument("--max-tokens", type=int, default=24)
+    parser.add_argument("--max-tokens", type=int, default=64)
     args = parser.parse_args()
 
     train_config = _config.get_config(args.config_name)

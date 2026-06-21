@@ -147,6 +147,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizeSubtaskTraining(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -370,6 +371,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                     _transforms.ResizeImages(224, 224),
                     _transforms.TokenizeSubtaskInference(
                         _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
                     ),
                     _transforms.PadStatesAndActions(model_config.action_dim),
                 ],
@@ -903,7 +905,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_subtask_libero",
-        model=pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=True),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -925,7 +927,7 @@ _CONFIGS = [
         name="pi05_subtask_pickup_round1_50ep_lora",
         model=pi0_config.Pi05SubtaskConfig(
             action_horizon=10,
-            discrete_state_input=False,
+            discrete_state_input=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
@@ -961,7 +963,7 @@ _CONFIGS = [
     # Point --policy.dir to a trained pi05_subtask_libero checkpoint.
     TrainConfig(
         name="pi05_subtask_libero_infer",
-        model=pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=True),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),

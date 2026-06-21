@@ -32,7 +32,7 @@ def main():
         type=str,
         default="pick up the black bowl on the stove and place it on the plate",
     )
-    parser.add_argument("--max_tokens", type=int, default=50)
+    parser.add_argument("--max_tokens", type=int, default=64)
     args = parser.parse_args()
 
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
@@ -44,7 +44,7 @@ def main():
     from openpi.models import pi0_config
     from openpi.models import tokenizer as _tokenizer
 
-    config = pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=False)
+    config = pi0_config.Pi05SubtaskConfig(action_horizon=10, discrete_state_input=True)
 
     logger.info(f"Loading params from {checkpoint_dir / 'params'}...")
     params = _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
@@ -55,7 +55,8 @@ def main():
 
     logger.info(f"Tokenizing prompt: '{args.prompt}'")
     tok = _tokenizer.PaligemmaTokenizer(max_len=config.max_token_len)
-    prefix_tokens, prefix_mask = tok.tokenize_high_level_prefix(args.prompt)
+    dummy_state = np.zeros((1, config.action_dim), dtype=np.float32)
+    prefix_tokens, prefix_mask = tok.tokenize_high_level_prefix(args.prompt, state=dummy_state[0])
 
     logger.info(f"  prefix_tokens shape: {prefix_tokens.shape}, non-pad count: {prefix_mask.sum()}")
     logger.info(f"  prefix text (decoded): {tok.detokenize(prefix_tokens)}")
@@ -71,8 +72,6 @@ def main():
         "left_wrist_0_rgb": np.array([True]),
         "right_wrist_0_rgb": np.array([False]),
     }
-    dummy_state = np.zeros((B, config.action_dim), dtype=np.float32)
-
     observation = _model.Observation(
         images=dummy_images,
         image_masks=dummy_image_masks,
