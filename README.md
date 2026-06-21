@@ -1,3 +1,16 @@
+# openpi-subtask
+
+This repository is a fork of OpenPI with pi0.5 subtask support. It adds a
+`PI05_SUBTASK` model path for joint subtask language modeling and flow-matching
+action training, plus two-stage inference where the policy generates a subtask
+from the high-level task before sampling actions.
+
+The intended training data is still based on LeRobot datasets, with the original
+high-level task prompt and additional per-frame or per-segment subtask labels
+from a subtask annotation workflow.
+
+The original OpenPI README continues below.
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
