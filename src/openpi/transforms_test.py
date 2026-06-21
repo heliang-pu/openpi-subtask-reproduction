@@ -191,3 +191,32 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_extract_prompt_from_lerobot_v3_task():
+    transform = _transforms.PromptFromLeRobotTask({})
+
+    data = transform({"task": "Pick the cup", "task_index": 3})
+
+    assert data["prompt"] == "Pick the cup"
+    assert "task" not in data
+
+
+def test_extract_subtask_from_lerobot_v3_subtask_index():
+    transform = _transforms.SubtaskFromLeRobotSubtask({2: "Grasp the cup"})
+
+    data = transform({"subtask_index": 2})
+
+    assert data["subtask"] == "Grasp the cup"
+
+    with pytest.raises(ValueError, match="subtask_index=3 not found in subtask mapping"):
+        transform({"subtask_index": 3})
+
+
+def test_extract_subtask_ignores_unannotated_index():
+    transform = _transforms.SubtaskFromLeRobotSubtask({2: "Grasp the cup"})
+
+    data = {"subtask_index": -1}
+
+    assert transform(data) is data
+    assert "subtask" not in data

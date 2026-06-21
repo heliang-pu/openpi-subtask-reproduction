@@ -1,7 +1,10 @@
 """Validate pi0.5 subtask generation on real LeRobot samples."""
 
 import argparse
+import copy
+import dataclasses
 import pathlib
+import random
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +12,7 @@ import numpy as np
 
 from openpi.models import model as _model
 from openpi.models import tokenizer as _tokenizer
+from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 import openpi.transforms as _transforms
@@ -43,7 +47,7 @@ def _batch_observation(data: dict) -> _model.Observation:
 
 
 def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> dict:
-    data = raw_sample
+    data = copy.deepcopy(raw_sample)
     transforms = [
         *data_config.repack_transforms.inputs,
         *data_config.data_transforms.inputs,
@@ -60,25 +64,81 @@ def _prepare_inference_sample(raw_sample: dict, data_config, model_config) -> di
     return data
 
 
+def _resolve_checkpoint_dir(checkpoint_dir: str | None, config_name: str) -> pathlib.Path:
+    root = pathlib.Path(checkpoint_dir) if checkpoint_dir is not None else pathlib.Path("checkpoints") / config_name
+    if (root / "params").exists():
+        return root
+
+    if not root.exists():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {root}")
+
+    direct_steps = [path for path in root.iterdir() if path.is_dir() and path.name.isdigit() and (path / "params").exists()]
+    if direct_steps:
+        return max(direct_steps, key=lambda path: int(path.name))
+
+    nested_steps = [
+        path
+        for path in root.glob("*/*")
+        if path.is_dir() and path.name.isdigit() and (path / "params").exists()
+    ]
+    if nested_steps:
+        return max(nested_steps, key=lambda path: (path.stat().st_mtime, int(path.name)))
+
+    raise FileNotFoundError(f"No complete checkpoint step with a params/ directory found under: {root}")
+
+
+def _with_checkpoint_norm_stats(data_config, checkpoint_dir: pathlib.Path):
+    if data_config.asset_id is None:
+        return data_config
+
+    norm_stats_path = checkpoint_dir / "assets" / data_config.asset_id / "norm_stats.json"
+    if not norm_stats_path.exists():
+        return data_config
+
+    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    return dataclasses.replace(data_config, norm_stats=norm_stats)
+
+
+def _select_indices(dataset, indices: str | None, num_samples: int, seed: int) -> list[int]:
+    if indices:
+        selected = [int(x) for x in indices.split(",") if x.strip()]
+    else:
+        rng = random.Random(seed)
+        selected = rng.sample(range(len(dataset)), k=min(num_samples, len(dataset)))
+
+    invalid = [index for index in selected if index < 0 or index >= len(dataset)]
+    if invalid:
+        raise IndexError(f"indices out of range for dataset of length {len(dataset)}: {invalid}")
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", default="pi05_subtask_pickup_round1_50ep_lora")
-    parser.add_argument("--checkpoint-dir", required=True)
-    parser.add_argument("--indices", default="0,100,500")
+    parser.add_argument(
+        "--checkpoint-dir",
+        help="A step directory, an experiment directory, or a config checkpoint root. Defaults to the latest step.",
+    )
+    parser.add_argument("--indices", help="Comma-separated dataset indices. Overrides --num-samples when set.")
+    parser.add_argument("--num-samples", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-tokens", type=int, default=64)
     args = parser.parse_args()
 
     train_config = _config.get_config(args.config_name)
+    checkpoint_dir = _resolve_checkpoint_dir(args.checkpoint_dir, args.config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    data_config = _with_checkpoint_norm_stats(data_config, checkpoint_dir)
     dataset = _data_loader.create_torch_dataset(data_config, train_config.model.action_horizon, train_config.model)
 
-    checkpoint_dir = pathlib.Path(args.checkpoint_dir)
     print(f"Loading checkpoint: {checkpoint_dir}")
+    print(f"Dataset length:     {len(dataset)}")
     params = _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
     model = train_config.model.load(params)
     tokenizer = _tokenizer.PaligemmaTokenizer(train_config.model.max_token_len)
 
-    indices = [int(x) for x in args.indices.split(",") if x.strip()]
+    indices = _select_indices(dataset, args.indices, args.num_samples, args.seed)
+    print(f"Sample indices:     {','.join(str(index) for index in indices)}")
     for index in indices:
         raw_sample = dataset[index]
         prompt = _as_text(raw_sample.get("prompt"))

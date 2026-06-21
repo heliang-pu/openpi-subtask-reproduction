@@ -2,12 +2,12 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -15,6 +15,11 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ImportError:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -127,6 +132,37 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _index_mapping(table, index_column: str, text_column: str | None = None) -> dict[int, str]:
+    """Normalize LeRobot v2/v3 metadata tables to {index: text}."""
+    if table is None:
+        return {}
+    if isinstance(table, dict):
+        return {int(k): str(v) for k, v in table.items()}
+    if hasattr(table, "iterrows") and index_column in table:
+        if text_column is not None and text_column in table:
+            return {int(row[index_column]): str(row[text_column]) for _, row in table.iterrows()}
+        return {int(row[index_column]): str(text) for text, row in table.iterrows()}
+    return {}
+
+
+def load_lerobot_subtask_mapping(dataset_meta) -> dict[int, str]:
+    mapping = _index_mapping(getattr(dataset_meta, "subtasks", None), "subtask_index", "subtask")
+    if mapping:
+        return mapping
+
+    subtasks_path = pathlib.Path(dataset_meta.root) / "meta" / "subtasks.parquet"
+    if not subtasks_path.exists():
+        return {}
+
+    try:
+        import pandas as pd
+    except ImportError:
+        logging.warning("Found %s but pandas is not available; subtask labels will be ignored.", subtasks_path)
+        return {}
+
+    return _index_mapping(pd.read_parquet(subtasks_path), "subtask_index", "subtask")
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,16 +173,23 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_kwargs = {"root": data_config.local_root} if data_config.local_root is not None else {}
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, **dataset_kwargs)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        **dataset_kwargs,
     )
 
+    metadata_transforms = []
+    if subtask_mapping := load_lerobot_subtask_mapping(dataset_meta):
+        metadata_transforms.append(_transforms.SubtaskFromLeRobotSubtask(subtask_mapping))
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        metadata_transforms.append(_transforms.PromptFromLeRobotTask(_index_mapping(dataset_meta.tasks, "task_index")))
+    if metadata_transforms:
+        dataset = TransformedDataset(dataset, metadata_transforms)
 
     return dataset
 

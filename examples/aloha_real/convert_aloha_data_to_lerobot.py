@@ -1,5 +1,5 @@
 """
-Script to convert Aloha hdf5 data to the LeRobot dataset v2.0 format.
+Script to convert Aloha hdf5 data to the LeRobot dataset v3.0 format.
 
 Example usage: uv run examples/aloha_real/convert_aloha_data_to_lerobot.py --raw-dir /path/to/raw/data --repo-id <org>/<dataset-name>
 """
@@ -10,13 +10,28 @@ import shutil
 from typing import Literal
 
 import h5py
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
 import numpy as np
 import torch
 import tqdm
 import tyro
+
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except ImportError:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+try:
+    from lerobot.constants import HF_LEROBOT_HOME
+except ImportError:
+    try:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+    except ImportError:
+        from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+try:
+    from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
+except ImportError:
+    download_raw = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,8 +124,8 @@ def create_empty_dataset(
             ],
         }
 
-    if Path(LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(LEROBOT_HOME / repo_id)
+    if Path(HF_LEROBOT_HOME / repo_id).exists():
+        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
     return LeRobotDataset.create(
         repo_id=repo_id,
@@ -209,6 +224,7 @@ def populate_dataset(
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
+                "task": task,
             }
 
             for camera, img_array in imgs_per_cam.items():
@@ -221,7 +237,7 @@ def populate_dataset(
 
             dataset.add_frame(frame)
 
-        dataset.save_episode(task=task)
+        dataset.save_episode()
 
     return dataset
 
@@ -238,12 +254,14 @@ def port_aloha(
     mode: Literal["video", "image"] = "image",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
-    if (LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(LEROBOT_HOME / repo_id)
+    if (HF_LEROBOT_HOME / repo_id).exists():
+        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
     if not raw_dir.exists():
         if raw_repo_id is None:
             raise ValueError("raw_repo_id must be provided if raw_dir does not exist")
+        if download_raw is None:
+            raise ImportError("download_raw is not available in this LeRobot version; provide an existing raw_dir.")
         download_raw(raw_dir, repo_id=raw_repo_id)
 
     hdf5_files = sorted(raw_dir.glob("episode_*.hdf5"))
@@ -262,7 +280,8 @@ def port_aloha(
         task=task,
         episodes=episodes,
     )
-    dataset.consolidate()
+    if hasattr(dataset, "finalize"):
+        dataset.finalize()
 
     if push_to_hub:
         dataset.push_to_hub()

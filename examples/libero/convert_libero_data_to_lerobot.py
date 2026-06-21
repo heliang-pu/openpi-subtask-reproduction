@@ -20,15 +20,21 @@ Running this conversion script will take approximately 30 minutes.
 
 import shutil
 
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
 
-from pathlib import Path
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except ImportError:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-
-HF_LEROBOT_HOME = Path("/storages/liweile/.cache/huggingface/lerobot")
+try:
+    from lerobot.constants import HF_LEROBOT_HOME
+except ImportError:
+    try:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+    except ImportError:
+        from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 
 REPO_NAME = "Lisavila/libero"  # Name of the output dataset, also used for the Hugging Face Hub
 RAW_DATASET_NAMES = [
@@ -94,6 +100,9 @@ def main(data_dir: str, *, push_to_hub: bool = False):
                     }
                 )
             dataset.save_episode()
+
+    if hasattr(dataset, "finalize"):
+        dataset.finalize()
 
     # Optionally push to the Hugging Face Hub
     if push_to_hub:

@@ -4,12 +4,15 @@ import argparse
 import copy
 import pathlib
 import random
+import re
 import textwrap
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 import torch
 
 from openpi.models import model as _model
@@ -29,6 +32,48 @@ def _as_text(value) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
+
+
+def _load_subtask_vocab(data_config) -> tuple[str, ...]:
+    if data_config.local_root is None:
+        return ()
+    subtasks_path = pathlib.Path(data_config.local_root) / "meta" / "subtasks.parquet"
+    if not subtasks_path.exists():
+        return ()
+    try:
+        import pandas as pd
+    except ImportError:
+        return ()
+
+    table = pd.read_parquet(subtasks_path)
+    labels = [str(value) for value in table["subtask"]] if "subtask" in table else [str(value) for value in table.index]
+    return tuple(sorted(set(labels), key=len, reverse=True))
+
+
+def _clean_generated_subtask(text: str, subtask_vocab: tuple[str, ...]) -> str:
+    text = re.sub(r"\s+", " ", _as_text(text)).strip()
+    if not text:
+        return text
+
+    text = re.sub(r"^Subtask:\s*", "", text, flags=re.IGNORECASE).strip()
+    for label in subtask_vocab:
+        if text.lower().startswith(label.lower()):
+            return label
+
+    cleanup_patterns = [
+        r"\s+Subtask:.*$",
+        r"\s+The red phone\b.*$",
+        r"\s+the red phone is\b.*$",
+        r"\s+This is because\b.*$",
+        r"\s+in the image\b.*$",
+        r"\s+Yes(?:Yes)*\b.*$",
+        r"\s+1(?:\s+1)+.*$",
+    ]
+    cleaned = text
+    for pattern in cleanup_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.removesuffix("left sidetop").strip(" .")
+    return cleaned or text
 
 
 def _to_hwc_uint8(image) -> np.ndarray:
@@ -73,7 +118,7 @@ def _batch_observation(data: dict) -> _model.Observation:
     return _model.Observation.from_dict(jax.tree.map(lambda x: np.asarray(x)[None, ...], obs_dict))
 
 
-def _load_font(size: int, bold: bool = False):
+def _load_font(size: int, *, bold: bool = False):
     names = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -133,6 +178,7 @@ def main() -> None:
     train_config = _config.get_config(args.config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     dataset = _data_loader.create_torch_dataset(data_config, train_config.model.action_horizon, train_config.model)
+    subtask_vocab = _load_subtask_vocab(data_config)
     episode, indices = _pick_episode_indices(dataset, args.seed, args.num_frames)
 
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
@@ -146,7 +192,7 @@ def main() -> None:
         data = _prepare_inference_sample(raw_sample, data_config, train_config.model)
         observation = _batch_observation(data)
         tokens = model.generate_subtask(observation, max_tokens=args.max_tokens)
-        generated = tokenizer.detokenize(np.asarray(tokens[0]))
+        generated = _clean_generated_subtask(tokenizer.detokenize(np.asarray(tokens[0])), subtask_vocab)
 
         rows.append(
             {

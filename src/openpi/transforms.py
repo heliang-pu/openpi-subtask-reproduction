@@ -252,6 +252,10 @@ class TokenizePrompt(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
+        data.pop("task", None)
+        data.pop("task_index", None)
+        data.pop("subtask", None)
+        data.pop("subtask_index", None)
 
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None:
@@ -290,6 +294,9 @@ class TokenizeSubtaskTraining(DataTransformFn):
             prompt = prompt.item()
 
         subtask = data.pop("subtask", None)
+        data.pop("task", None)
+        data.pop("task_index", None)
+        data.pop("subtask_index", None)
         if subtask is not None and not isinstance(subtask, str):
             subtask = subtask.item()
 
@@ -337,6 +344,10 @@ class TokenizeSubtaskInference(DataTransformFn):
             raise ValueError("Prompt is required for subtask inference")
         if not isinstance(prompt, str):
             prompt = prompt.item()
+        data.pop("task", None)
+        data.pop("task_index", None)
+        data.pop("subtask", None)
+        data.pop("subtask_index", None)
 
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None:
@@ -363,6 +374,10 @@ class TokenizeFASTInputs(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
+        data.pop("task", None)
+        data.pop("task_index", None)
+        data.pop("subtask", None)
+        data.pop("subtask_index", None)
 
         if not isinstance(prompt, str):
             prompt = prompt.item()
@@ -404,14 +419,39 @@ class PromptFromLeRobotTask(DataTransformFn):
     tasks: dict[int, str]
 
     def __call__(self, data: DataDict) -> DataDict:
+        if (task := data.pop("task", None)) is not None:
+            if not isinstance(task, str):
+                task = task.item()
+            return {**data, "prompt": task}
+
         if "task_index" not in data:
-            raise ValueError('Cannot extract prompt without "task_index"')
+            raise ValueError('Cannot extract prompt without "task" or "task_index"')
 
         task_index = int(data["task_index"])
         if (prompt := self.tasks.get(task_index)) is None:
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class SubtaskFromLeRobotSubtask(DataTransformFn):
+    """Extracts a subtask string from a LeRobot v3 subtask_index field."""
+
+    subtasks: dict[int, str]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "subtask" in data:
+            return data
+        if "subtask_index" not in data:
+            return data
+
+        subtask_index = int(data["subtask_index"])
+        if subtask_index < 0:
+            return data
+        if (subtask := self.subtasks.get(subtask_index)) is None:
+            raise ValueError(f"{subtask_index=} not found in subtask mapping: {self.subtasks}")
+        return {**data, "subtask": subtask}
 
 
 @dataclasses.dataclass(frozen=True)

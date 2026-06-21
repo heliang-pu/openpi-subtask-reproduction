@@ -3,13 +3,17 @@
 import argparse
 import copy
 import pathlib
+import re
 import textwrap
 
 import cv2
+import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 import torch
 
 from openpi.models import model as _model
@@ -29,6 +33,48 @@ def _as_text(value) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
+
+
+def _load_subtask_vocab(data_config) -> tuple[str, ...]:
+    if data_config.local_root is None:
+        return ()
+    subtasks_path = pathlib.Path(data_config.local_root) / "meta" / "subtasks.parquet"
+    if not subtasks_path.exists():
+        return ()
+    try:
+        import pandas as pd
+    except ImportError:
+        return ()
+
+    table = pd.read_parquet(subtasks_path)
+    labels = [str(value) for value in table["subtask"]] if "subtask" in table else [str(value) for value in table.index]
+    return tuple(sorted(set(labels), key=len, reverse=True))
+
+
+def _clean_generated_subtask(text: str, subtask_vocab: tuple[str, ...]) -> str:
+    text = re.sub(r"\s+", " ", _as_text(text)).strip()
+    if not text:
+        return text
+
+    text = re.sub(r"^Subtask:\s*", "", text, flags=re.IGNORECASE).strip()
+    for label in subtask_vocab:
+        if text.lower().startswith(label.lower()):
+            return label
+
+    cleanup_patterns = [
+        r"\s+Subtask:.*$",
+        r"\s+The red phone\b.*$",
+        r"\s+the red phone is\b.*$",
+        r"\s+This is because\b.*$",
+        r"\s+in the image\b.*$",
+        r"\s+Yes(?:Yes)*\b.*$",
+        r"\s+1(?:\s+1)+.*$",
+    ]
+    cleaned = text
+    for pattern in cleanup_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.removesuffix("left sidetop").strip(" .")
+    return cleaned or text
 
 
 def _to_hwc_uint8(image) -> np.ndarray:
@@ -78,7 +124,7 @@ def _batch_observation(samples: list[dict]) -> _model.Observation:
     return _model.Observation.from_dict(stacked)
 
 
-def _load_font(size: int, bold: bool = False):
+def _load_font(size: int, *, bold: bool = False):
     names = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -111,17 +157,18 @@ def _find_positive_segment(dataset, *, episode: int | None) -> list[int]:
     current: list[int] = []
     last_episode = None
     last_index = -2
-    for index, (ep, acp) in enumerate(zip(hf_dataset["episode_index"], hf_dataset["complementary_info.acp_indicator_r1"])):
-        ep = int(ep)
-        acp = int(acp)
-        is_positive = acp == 1 and (episode is None or ep == episode)
-        if is_positive and ep == last_episode and index == last_index + 1:
+    indicators = hf_dataset["complementary_info.acp_indicator_r1"]
+    for index, (episode_value, acp_value) in enumerate(zip(hf_dataset["episode_index"], indicators, strict=True)):
+        current_episode = int(episode_value)
+        acp = int(acp_value)
+        is_positive = acp == 1 and (episode is None or current_episode == episode)
+        if is_positive and current_episode == last_episode and index == last_index + 1:
             current.append(index)
         else:
             if current:
                 segments.append(current)
             current = [index] if is_positive else []
-        last_episode = ep
+        last_episode = current_episode
         last_index = index
     if current:
         segments.append(current)
@@ -158,11 +205,27 @@ def _find_positive_segment_containing(dataset, target_index: int) -> list[int]:
     return list(range(start, end + 1))
 
 
+def _find_episode_indices(dataset, episode: int) -> list[int]:
+    base_dataset = getattr(dataset, "_dataset", dataset)
+    hf_dataset = getattr(base_dataset, "hf_dataset", None)
+    if hf_dataset is None:
+        raise ValueError("Expected LeRobotDataset.hf_dataset for fast episode lookup.")
+
+    indices = [index for index, episode_value in enumerate(hf_dataset["episode_index"]) if int(episode_value) == episode]
+    if not indices:
+        raise ValueError(f"No frames found for episode={episode}.")
+    return indices
+
+
 def _sample_indices(indices: list[int], max_frames: int) -> list[int]:
     if len(indices) <= max_frames:
         return indices
     positions = np.linspace(0, len(indices) - 1, max_frames).round().astype(int)
     return [indices[pos] for pos in positions]
+
+
+def _parse_indices(indices: str) -> list[int]:
+    return [int(index) for index in indices.split(",") if index.strip()]
 
 
 def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -> np.ndarray:
@@ -174,8 +237,8 @@ def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -
     canvas = Image.new("RGB", (width, height), (248, 250, 252))
     draw = ImageDraw.Draw(canvas)
     margin = 24
-    draw.text((margin, 18), f"Successful segment | checkpoint {checkpoint_name}", font=title_font, fill=(15, 23, 42))
-    meta = f"episode {row['episode']} | frame {row['frame']} | dataset index {row['index']} | Advantage: positive"
+    draw.text((margin, 18), f"Subtask predictions | checkpoint {checkpoint_name}", font=title_font, fill=(15, 23, 42))
+    meta = f"episode {row['episode']} | frame {row['frame']} | dataset index {row['index']} | Advantage: {row['advantage']}"
     draw.text((margin, 52), meta, font=small_font, fill=(71, 85, 105))
 
     image_w, image_h = 512, 384
@@ -207,7 +270,7 @@ def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -
         68,
     )
 
-    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+    return np.asarray(canvas)
 
 
 def main() -> None:
@@ -216,66 +279,84 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--output", default="outputs/subtask_success_segment.mp4")
     parser.add_argument("--episode", type=int, default=None)
+    parser.add_argument("--full-episode", action="store_true", help="Use every frame from --episode instead of a positive segment.")
     parser.add_argument("--contains-index", type=int, default=None)
+    parser.add_argument("--indices", default=None, help="Comma-separated dataset indices. Overrides segment lookup.")
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--video-writer", choices=("imageio", "opencv"), default="imageio")
     args = parser.parse_args()
 
     train_config = _config.get_config(args.config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     dataset = _data_loader.create_torch_dataset(data_config, train_config.model.action_horizon, train_config.model)
-    if args.contains_index is not None:
+    subtask_vocab = _load_subtask_vocab(data_config)
+    if args.full_episode:
+        if args.episode is None:
+            raise ValueError("--full-episode requires --episode.")
+        segment = _find_episode_indices(dataset, args.episode)
+    elif args.indices is not None:
+        segment = _parse_indices(args.indices)
+    elif args.contains_index is not None:
         segment = _find_positive_segment_containing(dataset, args.contains_index)
     else:
         segment = _find_positive_segment(dataset, episode=args.episode)
     indices = _sample_indices(segment, args.max_frames)
 
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
+    print(f"Loading checkpoint: {checkpoint_dir}", flush=True)
     params = _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
     model = train_config.model.load(params)
     tokenizer = _tokenizer.PaligemmaTokenizer(train_config.model.max_token_len)
+    print(f"Loaded checkpoint. Rendering {len(indices)} frames.", flush=True)
 
     rows = []
-    prepared = []
-    raw_samples = []
-    for index in indices:
-        raw_sample = dataset[index]
-        raw_samples.append(raw_sample)
-        prepared.append(_prepare_inference_sample(raw_sample, data_config, train_config.model))
-
-    generated_text: list[str] = []
-    for start in range(0, len(prepared), args.batch_size):
-        batch = prepared[start : start + args.batch_size]
+    for start in range(0, len(indices), args.batch_size):
+        print(f"Generating subtasks {start + 1}-{min(start + args.batch_size, len(indices))}/{len(indices)}", flush=True)
+        batch_indices = indices[start : start + args.batch_size]
+        raw_samples = [dataset[index] for index in batch_indices]
+        batch = [_prepare_inference_sample(raw_sample, data_config, train_config.model) for raw_sample in raw_samples]
         observation = _batch_observation(batch)
         tokens = model.generate_subtask(observation, max_tokens=args.max_tokens)
-        for token_ids in np.asarray(tokens):
-            generated_text.append(tokenizer.detokenize(token_ids))
+        generated_text = [tokenizer.detokenize(token_ids) for token_ids in np.asarray(tokens)]
 
-    for index, raw_sample, generated in zip(indices, raw_samples, generated_text, strict=True):
-        rows.append(
-            {
-                "index": index,
-                "episode": int(raw_sample["episode_index"]),
-                "frame": int(raw_sample["frame_index"]),
-                "prompt": _as_text(raw_sample.get("prompt")),
-                "gt": _as_text(raw_sample.get("subtask")),
-                "generated": generated,
-                "top": _to_hwc_uint8(raw_sample["observation.images.top"]),
-                "wrist": _to_hwc_uint8(raw_sample["observation.images.left_wrist"]),
-            }
-        )
+        for index, raw_sample, generated in zip(batch_indices, raw_samples, generated_text, strict=True):
+            prompt = _as_text(raw_sample.get("prompt"))
+            rows.append(
+                {
+                    "index": index,
+                    "episode": int(raw_sample["episode_index"]),
+                    "frame": int(raw_sample["frame_index"]),
+                    "prompt": prompt,
+                    "advantage": (
+                        "positive"
+                        if "Advantage: positive" in prompt
+                        else "negative"
+                        if "Advantage: negative" in prompt
+                        else "n/a"
+                    ),
+                    "gt": _as_text(raw_sample.get("subtask")),
+                    "generated": _clean_generated_subtask(generated, subtask_vocab),
+                    "top": _to_hwc_uint8(raw_sample["observation.images.top"]),
+                    "wrist": _to_hwc_uint8(raw_sample["observation.images.left_wrist"]),
+                }
+            )
 
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    width, height = 1720, 560
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open video writer for {output}")
-    for row in rows:
-        writer.write(_render_frame(row, width=width, height=height, checkpoint_name=checkpoint_dir.name))
-    writer.release()
+    width, height = 1728, 560
+    frames = [_render_frame(row, width=width, height=height, checkpoint_name=checkpoint_dir.name) for row in rows]
+    if args.video_writer == "imageio":
+        iio.imwrite(output, frames, fps=args.fps, codec="libx264", pixelformat="yuv420p")
+    else:
+        writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {output}")
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
 
     print(output)
     print(f"positive_segment_len={len(segment)} sampled_frames={len(rows)}")

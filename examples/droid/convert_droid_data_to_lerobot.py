@@ -7,7 +7,7 @@ uv run examples/droid/convert_droid_data_to_lerobot.py --data_dir /path/to/your/
 If you want to push your dataset to the Hugging Face Hub, you can use the following command:
 uv run examples/droid/convert_droid_data_to_lerobot.py --data_dir /path/to/your/data --push_to_hub
 
-The resulting dataset will get saved to the $LEROBOT_HOME directory.
+The resulting dataset will get saved to the $HF_LEROBOT_HOME directory.
 """
 
 from collections import defaultdict
@@ -19,12 +19,23 @@ import shutil
 
 import cv2
 import h5py
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import tyro
+
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except ImportError:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+try:
+    from lerobot.constants import HF_LEROBOT_HOME
+except ImportError:
+    try:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+    except ImportError:
+        from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 
 REPO_NAME = "Lisavila/my_droid_dataset"  # Name of the output dataset, also used for the Hugging Face Hub
 
@@ -146,6 +157,9 @@ def main(data_dir: str, *, push_to_hub: bool = False):
                 }
             )
         dataset.save_episode()
+
+    if hasattr(dataset, "finalize"):
+        dataset.finalize()
 
     # Optionally push to the Hugging Face Hub
     if push_to_hub:

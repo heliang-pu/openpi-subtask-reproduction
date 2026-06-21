@@ -1,6 +1,8 @@
 import dataclasses
+import types
 
 import jax
+import pandas as pd
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -60,6 +62,16 @@ def test_with_fake_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_load_lerobot_v3_subtask_mapping(tmp_path):
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir()
+    pd.DataFrame({"subtask_index": [2]}, index=["Grasp the cup"]).to_parquet(meta_dir / "subtasks.parquet")
+
+    mapping = _data_loader.load_lerobot_subtask_mapping(types.SimpleNamespace(root=tmp_path))
+
+    assert mapping == {2: "Grasp the cup"}
 
 
 def test_with_real_dataset():

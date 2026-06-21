@@ -3,6 +3,13 @@
 This repository is an OpenPI fork for experimenting with subtask-aware pi0.5 policies.
 The original OpenPI README is preserved in [README_OPENPI.md](README_OPENPI.md).
 
+The intended training data is still based on LeRobot datasets. This fork supports
+LeRobotDataset v3.0 via a pinned `lerobot` v0.3.4 commit, including datasets
+collected locally under `HF_LEROBOT_HOME` or passed with `local_root` in the data
+config. For subtask training, v3 datasets with frame-level `subtask` annotations
+are used as the low-level prompt; datasets without subtasks fall back to the
+original task prompt.
+
 ## What Changed From OpenPI
 
 The upstream OpenPI policy predicts action chunks directly from a high-level task
