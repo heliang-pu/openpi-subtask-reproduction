@@ -409,6 +409,29 @@ class Pi05Subtask(Pi0):
         Returns:
             int32[B, gen_len] — generated token IDs including EOS.
         """
+        tokens, _, _ = self._generate_subtask_with_cache(observation, max_tokens=max_tokens)
+        return tokens
+
+    def _generate_subtask_with_cache(
+        self,
+        observation: _model.Observation,
+        *,
+        max_tokens: int = 50,
+    ) -> tuple[jnp.ndarray, _gemma.KVCache, jnp.ndarray]:
+        """Core of stage-1 inference, retaining the KV cache for stage-2 reuse.
+
+        Autoregressively (greedy) decodes the subtask while building up a KV cache
+        that covers ``[images][high-level prompt][subtask tokens]``. Returning the
+        cache lets ``sample_actions_hierarchical`` predict the action chunk without
+        re-encoding the images, and have the action expert attend to the subtask
+        under the same *causal* encoding it was trained with.
+
+        Returns:
+            tokens:     int32[B, gen_len] — generated token IDs (including EOS).
+            kv_cache:   KV cache over ``[images][prompt][subtask tokens]``.
+            cache_mask: bool[B, cache_len] — True for real tokens the action expert
+                        should attend to (False for the padding inside the prompt).
+        """
         observation = jax.tree.map(jnp.asarray, observation)
         observation = _model.preprocess_observation(None, observation, train=False)
 
@@ -436,29 +459,20 @@ class Pi05Subtask(Pi0):
 
         generated: list[jnp.ndarray] = []
         # Position encoding uses cumulative count (not sequence index).
-        num_real = jnp.sum(prefix_mask, axis=1)
-        next_pos = num_real.astype(jnp.int32)  # [B]
+        num_real = jnp.sum(prefix_mask, axis=1).astype(jnp.int32)  # [B]
 
         for i in range(max_tokens):
             next_token = jnp.argmax(logits[:, -1, :], axis=-1)  # [B]
             generated.append(next_token)
 
-            if jnp.all(next_token == PALIGEMMA_EOS_TOKEN):
-                break
-
-            next_emb = self.PaliGemma.llm(
-                next_token[:, None], method="embed"
-            )  # [B, 1, d]
-
+            # Append this token to the KV cache (incl. EOS, to match training where
+            # the action expert attends to "...<subtask> [EOS]").
+            next_emb = self.PaliGemma.llm(next_token[:, None], method="embed")  # [B,1,d]
             gen_count = i + 1
             gen_mask = jnp.ones((B, gen_count), dtype=jnp.bool_)
-            full_mask = jnp.concatenate(
-                [prefix_mask, gen_mask], axis=1
-            )  # [B, prefix_S + gen_count]
-            attn_mask = full_mask[:, None, :]  # [B, 1, prefix_S + gen_count]
-
-            new_positions = next_pos[:, None]  # [B, 1]
-
+            full_mask = jnp.concatenate([prefix_mask, gen_mask], axis=1)  # [B, prefix_S+gen_count]
+            attn_mask = full_mask[:, None, :]  # [B, 1, prefix_S+gen_count]
+            new_positions = (num_real + i)[:, None]  # [B, 1]
             (new_out, _), kv_cache = self.PaliGemma.llm(
                 [next_emb, None],
                 mask=attn_mask,
@@ -466,14 +480,81 @@ class Pi05Subtask(Pi0):
                 kv_cache=kv_cache,
             )
 
-            logits = self.PaliGemma.llm(
-                new_out, method="decode_to_logits"
-            )  # [B, 1, V]
-            next_pos = next_pos + 1
+            if jnp.all(next_token == PALIGEMMA_EOS_TOKEN):
+                break
+
+            logits = self.PaliGemma.llm(new_out, method="decode_to_logits")  # [B, 1, V]
 
         if not generated:
-            return jnp.zeros((B, 0), dtype=jnp.int32)
-        return jnp.stack(generated, axis=1)  # [B, gen_len]
+            return jnp.zeros((B, 0), dtype=jnp.int32), kv_cache, prefix_mask
+
+        tokens = jnp.stack(generated, axis=1)  # [B, gen_len]
+        cache_mask = jnp.concatenate(
+            [prefix_mask, jnp.ones((B, tokens.shape[1]), dtype=jnp.bool_)], axis=1
+        )
+        return tokens, kv_cache, cache_mask
+
+    def sample_actions_hierarchical(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        max_tokens: int = 50,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray]:
+        """Two-stage pi0.5 inference in a single pass (stage-1 cache reused by stage-2).
+
+        Stage 1 predicts the subtask and keeps its KV cache. Stage 2 runs
+        flow-matching for the action chunk while attending to that same cache, so
+        (a) the images are encoded only once, and (b) the action expert reads the
+        subtask under the *causal* encoding it was trained with — instead of
+        re-encoding the full prompt bidirectionally as a plain prefix would.
+
+        Runs eagerly (the subtask length, hence the cache length, is dynamic).
+
+        Returns:
+            actions:        the predicted action chunk.
+            subtask_tokens: int32[B, gen_len] generated subtask tokens (incl. EOS).
+        """
+        observation = jax.tree.map(jnp.asarray, observation)
+        subtask_tokens, kv_cache, cache_mask = self._generate_subtask_with_cache(
+            observation, max_tokens=max_tokens
+        )
+
+        # Stage 2: flow matching, reusing the prefix + subtask KV cache.
+        # pi05 embed_suffix only consumes the noisy actions + timestep, so the raw
+        # observation (just used for the batch dim) is sufficient here.
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        real_count = jnp.sum(cache_mask, axis=1)  # [B]
+        dt = -1.0 / num_steps
+        x_t = noise
+        time = 1.0
+        for _ in range(num_steps):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(jnp.asarray(time, jnp.float32), batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            # suffix attends to every real cache token (images + prompt + subtask).
+            prefix_attn_mask = einops.repeat(cache_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            # suffix positions follow the real cache tokens.
+            positions = real_count[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        return x_t, subtask_tokens
 
     def build_full_observation(
         self,

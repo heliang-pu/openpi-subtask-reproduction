@@ -91,28 +91,33 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
 
         # Pi0.5 two-stage inference.
-        # Stage 1 predicts the current subtask from the observation prefix.
-        # Do not cache by raw prompt: the prefix can include discretized state,
-        # and the visual observation also changes frame to frame.
+        # Stage 1 predicts the current subtask from the observation prefix; stage 2
+        # samples the action chunk while reusing stage 1's KV cache, so the images
+        # are encoded once and the action expert attends to the causally-encoded
+        # subtask (consistent with training). Do not cache by raw prompt: the prefix
+        # can include discretized state and the visual observation changes per frame.
         subtask_text = None
-        if (
+        use_hierarchical = (
             not self._is_pytorch_model
-            and hasattr(self._model, "generate_subtask")
+            and hasattr(self._model, "sample_actions_hierarchical")
             and observation.token_ar_mask is None
-        ):
-            subtask_tokens = self._model.generate_subtask(observation)
+        )
+
+        start_time = time.monotonic()
+        if use_hierarchical:
+            actions, subtask_tokens = self._model.sample_actions_hierarchical(
+                sample_rng_or_pytorch_device, observation, **sample_kwargs
+            )
             gen_len = subtask_tokens.shape[1]
             tok = _tokenizer.PaligemmaTokenizer(max_len=200)
             subtask_text = tok.detokenize(np.asarray(subtask_tokens[0]))
             logging.info(f"Subtask ({gen_len} tokens): {subtask_text}")
-
-            observation = self._model.build_full_observation(observation, subtask_tokens)
-
-        start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+            outputs = {"state": inputs["state"], "actions": actions}
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
