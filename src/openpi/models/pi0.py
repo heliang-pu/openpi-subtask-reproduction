@@ -370,6 +370,26 @@ class Pi05Subtask(Pi0):
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=1)
         attn_mask = make_attn_mask(input_mask, ar_mask)
+
+        # Paper-faithful low-level policy: the action tokens condition on o_t and the
+        # subtask l_hat only, NOT the high-level task l. Forbid the action suffix from
+        # attending to the high-level task text columns. Presence-gated: no effect
+        # when token_highlevel_mask is absent (base model / other configs / ablation).
+        if observation.token_highlevel_mask is not None:
+            hl_text = observation.token_highlevel_mask.astype(jnp.bool_)  # [B, num_text]
+            hl_col = jnp.concatenate(
+                [
+                    jnp.zeros((B, num_image_tokens), dtype=jnp.bool_),
+                    hl_text,
+                    jnp.zeros((B, suffix_tokens.shape[1]), dtype=jnp.bool_),
+                ],
+                axis=1,
+            )  # [B, S] — True over high-level task columns
+            seq_len = input_mask.shape[1]
+            is_action_row = (jnp.arange(seq_len) >= prefix_S)[None, :]  # [1, S]
+            forbid = is_action_row[:, :, None] & hl_col[:, None, :]  # [B, S, S]
+            attn_mask = attn_mask & ~forbid
+
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -409,7 +429,7 @@ class Pi05Subtask(Pi0):
         Returns:
             int32[B, gen_len] — generated token IDs including EOS.
         """
-        tokens, _, _ = self._generate_subtask_with_cache(observation, max_tokens=max_tokens)
+        tokens, _, _, _ = self._generate_subtask_with_cache(observation, max_tokens=max_tokens)
         return tokens
 
     def _generate_subtask_with_cache(
@@ -417,7 +437,7 @@ class Pi05Subtask(Pi0):
         observation: _model.Observation,
         *,
         max_tokens: int = 50,
-    ) -> tuple[jnp.ndarray, _gemma.KVCache, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, _gemma.KVCache, jnp.ndarray, jnp.ndarray]:
         """Core of stage-1 inference, retaining the KV cache for stage-2 reuse.
 
         Autoregressively (greedy) decodes the subtask while building up a KV cache
@@ -427,10 +447,14 @@ class Pi05Subtask(Pi0):
         under the same *causal* encoding it was trained with.
 
         Returns:
-            tokens:     int32[B, gen_len] — generated token IDs (including EOS).
-            kv_cache:   KV cache over ``[images][prompt][subtask tokens]``.
-            cache_mask: bool[B, cache_len] — True for real tokens the action expert
-                        should attend to (False for the padding inside the prompt).
+            tokens:      int32[B, gen_len] — generated token IDs (including EOS).
+            kv_cache:    KV cache over ``[images][prompt][subtask tokens]``.
+            cache_mask:  bool[B, cache_len] — True for real tokens (False for the
+                         padding inside the prompt). Used for suffix RoPE positions.
+            action_cache_mask: bool[B, cache_len] — cache_mask with the high-level
+                         task columns removed; what the action expert may attend to
+                         (paper: pi(a | o_t, l_hat)). Equals cache_mask when no
+                         token_highlevel_mask is present.
         """
         observation = jax.tree.map(jnp.asarray, observation)
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -444,6 +468,15 @@ class Pi05Subtask(Pi0):
 
         B = prefix_tokens.shape[0]
         prefix_S = prefix_tokens.shape[1]
+
+        # High-level (task) columns over the prefix — excluded from action attention.
+        num_text = self.max_token_len
+        num_image = prefix_S - num_text
+        if observation.token_highlevel_mask is not None:
+            hl_text = observation.token_highlevel_mask.astype(jnp.bool_)  # [B, num_text]
+        else:
+            hl_text = jnp.zeros((B, num_text), dtype=jnp.bool_)
+        prefix_hl = jnp.concatenate([jnp.zeros((B, num_image), dtype=jnp.bool_), hl_text], axis=1)  # [B, prefix_S]
 
         # Find the actual last real token INDEX in the sequence (not count-based).
         # sum(mask) is wrong as an index when masked-out regions (e.g. unused camera)
@@ -486,13 +519,18 @@ class Pi05Subtask(Pi0):
             logits = self.PaliGemma.llm(new_out, method="decode_to_logits")  # [B, 1, V]
 
         if not generated:
-            return jnp.zeros((B, 0), dtype=jnp.int32), kv_cache, prefix_mask
+            action_prefix_mask = prefix_mask & ~prefix_hl
+            return jnp.zeros((B, 0), dtype=jnp.int32), kv_cache, prefix_mask, action_prefix_mask
 
         tokens = jnp.stack(generated, axis=1)  # [B, gen_len]
-        cache_mask = jnp.concatenate(
-            [prefix_mask, jnp.ones((B, tokens.shape[1]), dtype=jnp.bool_)], axis=1
+        gen_ones = jnp.ones((B, tokens.shape[1]), dtype=jnp.bool_)
+        cache_mask = jnp.concatenate([prefix_mask, gen_ones], axis=1)
+        # Action attends to o_t (images + state) + subtask, but not the task columns.
+        highlevel_cache_mask = jnp.concatenate(
+            [prefix_hl, jnp.zeros((B, tokens.shape[1]), dtype=jnp.bool_)], axis=1
         )
-        return tokens, kv_cache, cache_mask
+        action_cache_mask = cache_mask & ~highlevel_cache_mask
+        return tokens, kv_cache, cache_mask, action_cache_mask
 
     def sample_actions_hierarchical(
         self,
@@ -518,7 +556,7 @@ class Pi05Subtask(Pi0):
             subtask_tokens: int32[B, gen_len] generated subtask tokens (incl. EOS).
         """
         observation = jax.tree.map(jnp.asarray, observation)
-        subtask_tokens, kv_cache, cache_mask = self._generate_subtask_with_cache(
+        subtask_tokens, kv_cache, cache_mask, action_cache_mask = self._generate_subtask_with_cache(
             observation, max_tokens=max_tokens
         )
 
@@ -538,8 +576,10 @@ class Pi05Subtask(Pi0):
                 observation, x_t, jnp.broadcast_to(jnp.asarray(time, jnp.float32), batch_size)
             )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # suffix attends to every real cache token (images + prompt + subtask).
-            prefix_attn_mask = einops.repeat(cache_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            # Action attends to o_t (images + state) + subtask, but NOT the high-level
+            # task columns (action_cache_mask drops them; cache_mask keeps them for
+            # RoPE positions, so the task still occupies sequence positions).
+            prefix_attn_mask = einops.repeat(action_cache_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             # suffix positions follow the real cache tokens.
             positions = real_count[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1

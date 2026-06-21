@@ -38,11 +38,34 @@ class PaligemmaTokenizer:
         discretized_state = np.digitize(np.asarray(state), bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         return " ".join(map(str, discretized_state.reshape(-1)))
 
-    def _format_subtask_prefix(self, high_prompt: str, state: np.ndarray | None = None) -> str:
+    def _format_subtask_prefix_parts(
+        self, high_prompt: str, state: np.ndarray | None = None
+    ) -> tuple[str, str]:
+        """Split the subtask prefix into (high-level task part, low-level-visible part).
+
+        The task part ("Task: <high>...") is the high-level instruction l that the
+        low-level action policy must NOT attend to (paper: pi(a | o_t, l_hat) depends
+        on the subtask l_hat only). The rest ("State: ...;\\nSubtask: ") carries the
+        o_t state + the subtask scaffolding and stays visible to the action expert.
+        """
         cleaned_high = self._clean_text(high_prompt, lowercase=True, strip_terminal_punctuation=True)
         if state is None:
-            return f"Task: {cleaned_high}. Subtask: "
-        return f"Task: {cleaned_high}, State: {self._format_discretized_state(state)};\nSubtask: "
+            return f"Task: {cleaned_high}. ", "Subtask: "
+        return f"Task: {cleaned_high}, ", f"State: {self._format_discretized_state(state)};\nSubtask: "
+
+    def _format_subtask_prefix(self, high_prompt: str, state: np.ndarray | None = None) -> str:
+        task_part, rest_part = self._format_subtask_prefix_parts(high_prompt, state)
+        return task_part + rest_part
+
+    def highlevel_task_token_len(self, high_prompt: str, state: np.ndarray | None = None) -> int:
+        """Number of leading tokens (incl. BOS) encoding the high-level task l.
+
+        These are exactly the tokens excluded from the low-level action policy's
+        attention. Uses the same piecewise encoding as the tokenize_* methods, so the
+        count aligns with the token sequence they produce.
+        """
+        task_part, _ = self._format_subtask_prefix_parts(high_prompt, state)
+        return len(self._tokenizer.encode(task_part, add_bos=True))
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = self._clean_text(prompt)
@@ -95,8 +118,10 @@ class PaligemmaTokenizer:
             ar_mask:   int32[max_len]  — 0 = bidirectional, 1 = causal.
             loss_mask: bool[max_len]   — True where CE loss is applied.
         """
-        prefix_str = self._format_subtask_prefix(high_prompt, state)
-        prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+        # Encode the task part and the rest separately so the high-level/low-level
+        # token boundary is exact (see highlevel_task_token_len).
+        task_part, rest_part = self._format_subtask_prefix_parts(high_prompt, state)
+        prefix_tokens = self._tokenizer.encode(task_part, add_bos=True) + self._tokenizer.encode(rest_part)
 
         cleaned_low = self._clean_text(low_prompt, lowercase=True, strip_terminal_punctuation=True)
         suffix_tokens = self._tokenizer.encode(cleaned_low) + [PALIGEMMA_EOS_TOKEN]
@@ -147,8 +172,9 @@ class PaligemmaTokenizer:
             tokens: int32[max_len]
             mask:   bool[max_len] — True for real tokens, False for padding.
         """
-        prefix_str = self._format_subtask_prefix(high_prompt, state)
-        tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+        # Piecewise encoding keeps the high-level/low-level token boundary exact.
+        task_part, rest_part = self._format_subtask_prefix_parts(high_prompt, state)
+        tokens = self._tokenizer.encode(task_part, add_bos=True) + self._tokenizer.encode(rest_part)
 
         tokens_len = len(tokens)
         if tokens_len < self._max_len:

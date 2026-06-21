@@ -149,5 +149,6 @@ class Pi05SubtaskConfig(Pi0Config):
                 tokenized_prompt_mask=obs_spec.tokenized_prompt_mask,
                 token_ar_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_),
+                token_highlevel_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_),
             )
         return obs_spec, action_spec

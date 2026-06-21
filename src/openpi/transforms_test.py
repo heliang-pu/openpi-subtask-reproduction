@@ -23,6 +23,10 @@ class _RecordingSubtaskTokenizer:
         self.inference_calls.append((high_prompt, state))
         return np.asarray([1, 2, 0], dtype=np.int32), np.asarray([True, True, False])
 
+    def highlevel_task_token_len(self, high_prompt, state=None):
+        # Pretend the first token is the high-level task region.
+        return 1
+
 
 def test_repack_transform():
     transform = _transforms.RepackTransform(
@@ -119,6 +123,7 @@ def test_tokenize_subtask_training_uses_subtask_and_state():
     assert np.all(data["tokenized_prompt"] == np.asarray([1, 2, 3]))
     assert np.all(data["token_ar_mask"] == np.asarray([0, 1, 1]))
     assert np.all(data["token_loss_mask"] == np.asarray([False, True, True]))
+    assert np.all(data["token_highlevel_mask"] == np.asarray([True, False, False]))
 
 
 def test_tokenize_subtask_training_requires_state_when_enabled():
@@ -141,6 +146,7 @@ def test_tokenize_subtask_inference_uses_state():
     assert recorded_state is state
     assert np.all(data["tokenized_prompt"] == np.asarray([1, 2, 0]))
     assert np.all(data["tokenized_prompt_mask"] == np.asarray([True, True, False]))
+    assert np.all(data["token_highlevel_mask"] == np.asarray([True, False, False]))
 
 
 def test_tokenize_subtask_inference_requires_state_when_enabled():

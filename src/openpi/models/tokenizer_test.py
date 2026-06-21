@@ -31,7 +31,8 @@ def test_tokenize_subtask_prefix_includes_discretized_state():
     state = np.asarray([-1.0, 0.0, 1.0], dtype=np.float32)
     tokens, mask = tokenizer.tokenize_high_level_prefix("Pick_up_block", state=state)
 
-    encoded_prefix = tokenizer._tokenizer.encoded_texts[0]
+    # The prefix is now encoded piecewise (task part + state/subtask part).
+    encoded_prefix = "".join(tokenizer._tokenizer.encoded_texts)
     assert encoded_prefix == "Task: pick up block, State: 0 128 255;\nSubtask: "
     assert tokens.shape == (128,)
     assert mask.sum() == len(encoded_prefix) + 1
@@ -47,7 +48,10 @@ def test_tokenize_subtask_training_includes_discretized_state_before_subtask_tar
         "Pick_up_block", "move to block", state=state
     )
 
-    encoded_prefix, encoded_suffix = tokenizer._tokenizer.encoded_texts
+    # The prefix is encoded piecewise (task part + state/subtask part); the last
+    # encode call is the low-level subtask target.
+    *prefix_parts, encoded_suffix = tokenizer._tokenizer.encoded_texts
+    encoded_prefix = "".join(prefix_parts)
     assert encoded_prefix == "Task: pick up block, State: 0 128 255;\nSubtask: "
     assert encoded_suffix == "move to block"
     assert tokens.shape == (128,)

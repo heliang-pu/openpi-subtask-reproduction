@@ -277,6 +277,10 @@ class TokenizeSubtaskTraining(DataTransformFn):
     """
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # Paper-faithful low-level policy: emit token_highlevel_mask so the action
+    # expert does not attend to the high-level task (pi(a | o_t, l_hat)). Set False
+    # to revert to the previous behavior (action attends to the task too).
+    mask_task_from_action: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         prompt = data.pop("prompt", None)
@@ -301,13 +305,17 @@ class TokenizeSubtaskTraining(DataTransformFn):
         tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(
             high_prompt, low_prompt, state=state
         )
-        return {
+        out = {
             **data,
             "tokenized_prompt": tokens,
             "tokenized_prompt_mask": mask,
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
         }
+        if self.mask_task_from_action:
+            task_len = self.tokenizer.highlevel_task_token_len(high_prompt, state=state)
+            out["token_highlevel_mask"] = np.arange(len(tokens)) < task_len
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,6 +328,8 @@ class TokenizeSubtaskInference(DataTransformFn):
     """
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # Must match the value used at training time (see TokenizeSubtaskTraining).
+    mask_task_from_action: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         prompt = data.pop("prompt", None)
@@ -335,11 +345,15 @@ class TokenizeSubtaskInference(DataTransformFn):
             state = None
 
         tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt, state=state)
-        return {
+        out = {
             **data,
             "tokenized_prompt": tokens,
             "tokenized_prompt_mask": mask,
         }
+        if self.mask_task_from_action:
+            task_len = self.tokenizer.highlevel_task_token_len(prompt, state=state)
+            out["token_highlevel_mask"] = np.arange(len(tokens)) < task_len
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
