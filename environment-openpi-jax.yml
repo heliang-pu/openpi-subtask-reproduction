@@ -1,0 +1,32 @@
+# Create this environment from the repository root:
+#   conda env create -f environment-openpi-jax.yml
+#   conda activate openpi-jax
+#
+# The JAX build uses CUDA 12 wheels. A compatible NVIDIA driver is still required
+# on the host machine.
+name: openpi-jax
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.11
+  - pip>=24
+  - git
+  - git-lfs
+  - ffmpeg>=7
+  - pkg-config
+  - compilers
+  - cmake
+  - make
+  - pip:
+      - "lerobot @ git+https://github.com/huggingface/lerobot@33cad37054c2b594ceba57463e8f11ee374fa93c"
+      - "dlimp @ git+https://github.com/kvablack/dlimp@ad72ce3a9b414db2185bc0b38461d4101a65477a"
+      - "-e packages/openpi-client"
+      - "-e ."
+      - "pytest>=8.3.4"
+      - "ruff>=0.8.6"
+      - "pre-commit>=4.0.1"
+      - "ipykernel>=6.29.5"
+      - "ipywidgets>=8.1.5"
+      - "matplotlib>=3.10.0"
+      - "pynvml>=12.0.0"
