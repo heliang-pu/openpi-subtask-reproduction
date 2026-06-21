@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -65,6 +66,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local LeRobot dataset root. When set, LeRobotDataset will load from this exact directory instead of
+    # the default $HF_LEROBOT_HOME/repo_id cache path.
+    local_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -178,6 +182,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Optional local LeRobot dataset root, useful for v3 datasets collected locally.
+    local_root: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -193,6 +199,7 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            local_root=self.local_root,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -376,6 +383,91 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+def _parse_single_arm_image(image) -> np.ndarray:
+    image = np.asarray(image)
+    if np.issubdtype(image.dtype, np.floating):
+        image = (255 * image).astype(np.uint8)
+    if image.shape[0] == 3:
+        image = np.moveaxis(image, 0, -1)
+    return image
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleArmCameraBoxInputs(_transforms.DataTransformFn):
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_single_arm_image(data["observation/image"])
+        wrist_image = _parse_single_arm_image(data["observation/wrist_image"])
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            },
+        }
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        if "subtask" in data:
+            inputs["subtask"] = data["subtask"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleArmCameraBoxOutputs(_transforms.DataTransformFn):
+    action_dim: int = 7
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSingleArmDataConfig(DataConfigFactory):
+    image_key: str = "observation.images.top"
+    wrist_image_key: str = "observation.images.left_wrist"
+    action_sequence_keys: Sequence[str] = ("action",)
+    output_action_dim: int = 7
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": self.image_key,
+                        "observation/wrist_image": self.wrist_image_key,
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "subtask": "subtask",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[SingleArmCameraBoxInputs(model_type=model_config.model_type)],
+            outputs=[SingleArmCameraBoxOutputs(action_dim=self.output_action_dim)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -828,6 +920,40 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_subtask_pickup_round1_50ep_lora",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSingleArmDataConfig(
+            repo_id="pickup_round1_300_openpi_acp_prompt_ep50",
+            local_root="/workspace/dataset/agi_arm_bot/v3.0/without_tactile/pickup_round1_300_openpi_acp_prompt_ep50",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=500,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=500,
+        log_interval=10,
+        save_interval=100,
+        wandb_enabled=False,
     ),
     # Inference-only config for pi0.5 subtask generation on LIBERO.
     # Uses TokenizeSubtaskInference (prefix-only prompt) so that the model
