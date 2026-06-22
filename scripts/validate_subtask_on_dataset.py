@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import pathlib
 import random
+import re
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +29,31 @@ def _as_text(value) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
+
+
+def _load_subtask_vocab(data_config) -> tuple[str, ...]:
+    if data_config.local_root is None:
+        return ()
+    subtasks_path = pathlib.Path(data_config.local_root) / "meta" / "subtasks.parquet"
+    if not subtasks_path.exists():
+        return ()
+    try:
+        import pandas as pd
+    except ImportError:
+        return ()
+
+    table = pd.read_parquet(subtasks_path)
+    labels = [str(value) for value in table["subtask"]] if "subtask" in table else [str(value) for value in table.index]
+    return tuple(sorted(set(labels), key=len, reverse=True))
+
+
+def _clean_generated_subtask(text: str, subtask_vocab: tuple[str, ...]) -> str:
+    text = re.sub(r"\s+", " ", _as_text(text)).strip()
+    text = re.sub(r"^Subtask:\s*", "", text, flags=re.IGNORECASE).strip()
+    for label in subtask_vocab:
+        if text.lower().startswith(label.lower()):
+            return label
+    return text.strip(" .")
 
 
 def _batch_observation(data: dict) -> _model.Observation:
@@ -123,6 +149,7 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--show-token-ids", action="store_true")
     args = parser.parse_args()
 
     train_config = _config.get_config(args.config_name)
@@ -130,6 +157,7 @@ def main() -> None:
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     data_config = _with_checkpoint_norm_stats(data_config, checkpoint_dir)
     dataset = _data_loader.create_torch_dataset(data_config, train_config.model.action_horizon, train_config.model)
+    subtask_vocab = _load_subtask_vocab(data_config)
 
     print(f"Loading checkpoint: {checkpoint_dir}")
     print(f"Dataset length:     {len(dataset)}")
@@ -139,6 +167,7 @@ def main() -> None:
 
     indices = _select_indices(dataset, args.indices, args.num_samples, args.seed)
     print(f"Sample indices:     {','.join(str(index) for index in indices)}")
+    correct = 0
     for index in indices:
         raw_sample = dataset[index]
         prompt = _as_text(raw_sample.get("prompt"))
@@ -148,7 +177,9 @@ def main() -> None:
 
         tokens = model.generate_subtask(observation, max_tokens=args.max_tokens)
         token_ids = np.asarray(tokens[0])
-        generated = tokenizer.detokenize(token_ids)
+        generated = _clean_generated_subtask(tokenizer.detokenize(token_ids), subtask_vocab)
+        is_correct = generated == gt_subtask
+        correct += int(is_correct)
         hit_max_tokens = len(token_ids) >= args.max_tokens and _tokenizer.PALIGEMMA_EOS_TOKEN not in token_ids
 
         print("\n" + "=" * 80)
@@ -156,9 +187,11 @@ def main() -> None:
         print(f"prompt:    {prompt}")
         print(f"gt:        {gt_subtask}")
         print(f"generated: {generated}")
-        print(f"tokens:    count={len(token_ids)} hit_max_tokens={hit_max_tokens}")
-        print(f"token_ids: {token_ids.tolist()}")
+        print(f"exact:     {is_correct} tokens={len(token_ids)} hit_max_tokens={hit_max_tokens}")
+        if args.show_token_ids:
+            print(f"token_ids: {token_ids.tolist()}")
     print("=" * 80)
+    print(f"exact_match: {correct}/{len(indices)} = {correct / max(1, len(indices)):.2%}")
 
 
 if __name__ == "__main__":

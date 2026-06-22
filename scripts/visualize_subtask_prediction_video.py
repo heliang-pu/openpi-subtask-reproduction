@@ -228,6 +228,15 @@ def _parse_indices(indices: str) -> list[int]:
     return [int(index) for index in indices.split(",") if index.strip()]
 
 
+def _raw_image(raw_sample: dict, preferred_key: str, fallbacks: tuple[str, ...]) -> np.ndarray:
+    if preferred_key in raw_sample:
+        return _to_hwc_uint8(raw_sample[preferred_key])
+    for key in fallbacks:
+        if key in raw_sample:
+            return _to_hwc_uint8(raw_sample[key])
+    raise KeyError(f"Could not find image key {preferred_key!r}; available keys: {sorted(raw_sample)}")
+
+
 def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -> np.ndarray:
     title_font = _load_font(26, bold=True)
     label_font = _load_font(20, bold=True)
@@ -247,10 +256,10 @@ def _render_frame(row: dict, *, width: int, height: int, checkpoint_name: str) -
     top_img = Image.fromarray(row["top"]).resize((image_w, image_h), Image.Resampling.LANCZOS)
     wrist_img = Image.fromarray(row["wrist"]).resize((image_w, image_h), Image.Resampling.LANCZOS)
     canvas.paste(top_img, (margin, y_img + 28))
-    draw.text((margin, y_img), "top camera", font=label_font, fill=(30, 41, 59))
+    draw.text((margin, y_img), row["top_label"], font=label_font, fill=(30, 41, 59))
     x_wrist = margin + image_w + gap
     canvas.paste(wrist_img, (x_wrist, y_img + 28))
-    draw.text((x_wrist, y_img), "left wrist", font=label_font, fill=(30, 41, 59))
+    draw.text((x_wrist, y_img), row["wrist_label"], font=label_font, fill=(30, 41, 59))
 
     text_x = margin + image_w * 2 + gap * 2
     text_y = y_img
@@ -293,6 +302,8 @@ def main() -> None:
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     dataset = _data_loader.create_torch_dataset(data_config, train_config.model.action_horizon, train_config.model)
     subtask_vocab = _load_subtask_vocab(data_config)
+    image_key = getattr(train_config.data, "image_key", "observation.images.top")
+    wrist_image_key = getattr(train_config.data, "wrist_image_key", "observation.images.left_wrist")
     if args.full_episode:
         if args.episode is None:
             raise ValueError("--full-episode requires --episode.")
@@ -339,8 +350,14 @@ def main() -> None:
                     ),
                     "gt": _as_text(raw_sample.get("subtask")),
                     "generated": _clean_generated_subtask(generated, subtask_vocab),
-                    "top": _to_hwc_uint8(raw_sample["observation.images.top"]),
-                    "wrist": _to_hwc_uint8(raw_sample["observation.images.left_wrist"]),
+                    "top": _raw_image(raw_sample, image_key, ("observation.images.top", "observation.images.image", "image")),
+                    "wrist": _raw_image(
+                        raw_sample,
+                        wrist_image_key,
+                        ("observation.images.left_wrist", "observation.images.image2", "wrist_image"),
+                    ),
+                    "top_label": image_key,
+                    "wrist_label": wrist_image_key,
                 }
             )
 

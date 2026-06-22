@@ -441,6 +441,7 @@ class LeRobotSingleArmDataConfig(DataConfigFactory):
     wrist_image_key: str = "observation.images.left_wrist"
     action_sequence_keys: Sequence[str] = ("action",)
     output_action_dim: int = 7
+    subtask_inference: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -462,7 +463,19 @@ class LeRobotSingleArmDataConfig(DataConfigFactory):
             inputs=[SingleArmCameraBoxInputs(model_type=model_config.model_type)],
             outputs=[SingleArmCameraBoxOutputs(action_dim=self.output_action_dim)],
         )
-        model_transforms = ModelTransformFactory()(model_config)
+        if self.subtask_inference:
+            model_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeSubtaskInference(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ],
+            )
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -955,6 +968,128 @@ _CONFIGS = [
         num_train_steps=500,
         log_interval=10,
         save_interval=100,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_libero_tasks0_4_lora",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSingleArmDataConfig(
+            repo_id="lerobot_libero_tasks0_4_subtask",
+            local_root="/workspace/dataset/lerobot_libero_tasks0_4_subtask",
+            image_key="observation.images.image",
+            wrist_image_key="observation.images.image2",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=3_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=3_000,
+        log_interval=10,
+        save_interval=500,
+        keep_period=1_000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_libero_tasks0_4_full",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotSingleArmDataConfig(
+            repo_id="lerobot_libero_tasks0_4_subtask",
+            local_root="/workspace/dataset/lerobot_libero_tasks0_4_subtask",
+            image_key="observation.images.image",
+            wrist_image_key="observation.images.image2",
+            assets=AssetsConfig(
+                assets_dir="/workspace/shared/openpi-subtask/assets/pi05_subtask_libero_tasks0_4_lora",
+                asset_id="lerobot_libero_tasks0_4_subtask",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=3_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        ema_decay=None,
+        num_train_steps=3_000,
+        log_interval=10,
+        save_interval=2_000,
+        keep_period=None,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_libero_tasks0_4_full_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotSingleArmDataConfig(
+            repo_id="lerobot_libero_tasks0_4_subtask",
+            local_root="/workspace/dataset/lerobot_libero_tasks0_4_subtask",
+            image_key="observation.images.image",
+            wrist_image_key="observation.images.image2",
+            assets=AssetsConfig(
+                assets_dir="/workspace/shared/openpi-subtask/assets/pi05_subtask_libero_tasks0_4_lora",
+                asset_id="lerobot_libero_tasks0_4_subtask",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_libero_tasks0_4_lora_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSingleArmDataConfig(
+            repo_id="lerobot_libero_tasks0_4_subtask",
+            local_root="/workspace/dataset/lerobot_libero_tasks0_4_subtask",
+            image_key="observation.images.image",
+            wrist_image_key="observation.images.image2",
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
         wandb_enabled=False,
     ),
     # Inference-only config for pi0.5 subtask generation on LIBERO.
