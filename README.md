@@ -1,152 +1,134 @@
-# openpi-subtask
+# openpi-subtask-reproduction
 
-This repository is an OpenPI fork for experimenting with subtask-aware pi0.5 policies.
-The original OpenPI README is preserved in [README_OPENPI.md](README_OPENPI.md).
+[中文说明](README_CN.md) | English
 
-The intended training data is still based on LeRobot datasets. This fork supports
-LeRobotDataset v3.0 via a pinned `lerobot` v0.3.4 commit, including datasets
-collected locally under `HF_LEROBOT_HOME` or passed with `local_root` in the data
-config. For subtask training, v3 datasets with frame-level `subtask` annotations
-are used as the low-level prompt; datasets without subtasks fall back to the
-original task prompt.
+Full OpenPI/JAX reproduction fork with pi0.5-style two-stage subtask inference.
 
-## What Changed From OpenPI
+This repository is a fork of OpenPI. The upstream OpenPI README is preserved as
+[README_OPENPI.md](README_OPENPI.md).
 
-The upstream OpenPI policy predicts action chunks directly from a high-level task
-prompt, images, and robot state:
+The goal of this fork is to reproduce the OpenPI training/inference stack and add
+the pi0.5 hierarchical subtask path:
 
 ```text
-Task + observation -> actions
+high-level task + observation -> generated subtask -> action chunk
 ```
 
-This fork adds a subtask language step for pi0.5:
+It is a code and pipeline reproduction. It does not reproduce Physical
+Intelligence's private pi0.5 data mixture, full-scale training recipe, or reported
+real-world performance.
 
-```text
-Task -> Subtask -> actions
-```
+## Architecture
 
-The goal is to let the model first predict a short low-level stage such as
-`grasp the yellow camera`, then condition action generation on both the original
-task and the generated subtask.
+![pi0.5 two-stage subtask inference](docs/pi05_subtask_two_stage_execution_flow_en.png)
 
-## Main Additions
+The diagram above follows the core factorization from the pi0.5 paper,
+`pi0.5: A Vision-Language-Action Model with Open-World Generalization`:
 
-### 1. New pi0.5 Subtask Model Type
+- The model first predicts a semantic subtask from the current observation and
+  high-level task: `pi(l_hat | o_t, l)`.
+- The action expert then predicts low-level action chunks conditioned on the
+  observation and generated subtask: `pi(a | o_t, l_hat)`.
+- Robot proprioceptive state is discretized into language tokens for pi0.5-style
+  prompting.
+- Continuous action chunks are generated with the pi0 / pi0.5 flow-matching
+  action expert.
+- Prefix tokens are bidirectional, while generated subtask tokens are decoded
+  autoregressively.
 
-This fork adds `PI05_SUBTASK` and `Pi05SubtaskConfig`.
+The KV-cache reuse shown in the figure is this fork's implementation detail: stage
+1 builds a cache over `[images][high-level task][subtask]`, and stage 2 reuses it
+so images are encoded once. The action expert is masked so it attends to
+`o_t + l_hat` and not to the high-level task `l`, matching the paper's low-level
+factorization.
+
+## What This Fork Adds
+
+### pi0.5 subtask model type
+
+This fork adds:
+
+- `ModelType.PI05_SUBTASK`
+- `Pi05SubtaskConfig`
+- `Pi05Subtask`
 
 Key files:
 
-- `src/openpi/models/model.py`
-- `src/openpi/models/pi0_config.py`
-- `src/openpi/models/pi0.py`
+- [src/openpi/models/model.py](src/openpi/models/model.py)
+- [src/openpi/models/pi0_config.py](src/openpi/models/pi0_config.py)
+- [src/openpi/models/pi0.py](src/openpi/models/pi0.py)
 
-`Pi05Subtask` keeps the pi0.5 architecture but changes the training objective.
-It adds a language-modeling cross-entropy loss on the subtask tokens while
-keeping the original flow-matching action loss.
+Training combines:
 
 ```text
-total loss = subtask CE loss + action flow-matching loss
+subtask cross-entropy loss + action flow-matching loss
 ```
 
-### 2. Subtask Prompt Tokenization
+### State-conditioned subtask tokenization
 
-The tokenizer now supports a high-level task plus low-level subtask format:
+For pi0.5 subtask training/inference, prompts can include discretized robot state:
 
 ```text
-[BOS] Task: <high-level task>. Subtask: <low-level subtask> [EOS] [PAD...]
+Task: <high-level task>, State: <discretized_state>;
+Subtask: <low-level subtask>
 ```
 
-During training:
-
-- `Task: ... Subtask: ` is treated as the prefix.
-- Tokens after `Subtask:` are autoregressive.
-- Cross-entropy loss is applied only to the subtask portion.
-
-During inference:
+During inference, the model receives only the prefix:
 
 ```text
-[BOS] Task: <high-level task>. Subtask: [PAD...]
+Task: <high-level task>, State: <discretized_state>;
+Subtask:
 ```
 
-The model autoregressively fills in the subtask.
+and autoregressively generates the subtask text.
 
 Key files:
 
-- `src/openpi/models/tokenizer.py`
-- `src/openpi/transforms.py`
+- [src/openpi/models/tokenizer.py](src/openpi/models/tokenizer.py)
+- [src/openpi/transforms.py](src/openpi/transforms.py)
 
-### 3. Two-Stage Inference
+### Paper-faithful low-level conditioning
 
-The policy can now run:
+The latest implementation emits `token_highlevel_mask` for subtask paths. During
+stage-2 action generation, the action expert attends to image/state tokens and
+generated subtask tokens, while high-level task columns are removed from the
+action attention mask:
 
 ```text
-1. generate_subtask(observation)
-2. build_full_observation(observation, generated_subtask)
-3. sample_actions(full_observation)
+low-level policy: pi(a | o_t, l_hat)
 ```
 
-The generated subtask is also returned in the policy output as:
+This is the important distinction from a plain "Task + Subtask -> actions" prompt:
+the high-level task is used to infer the subtask, but the low-level action expert
+executes the generated subtask.
+
+### Two-stage inference
+
+Inference can run as:
+
+```text
+1. generate subtask from image/state/task prefix
+2. reuse the stage-1 KV cache
+3. sample the action chunk with flow matching
+4. return both actions and generated_subtask
+```
+
+Key methods:
+
+- `generate_subtask(...)`
+- `_generate_subtask_with_cache(...)`
+- `sample_actions_hierarchical(...)`
+
+Key output:
 
 ```text
 generated_subtask
 ```
 
-Subtask generation is cached by prompt in `Policy.infer()` so repeated calls for
-the same high-level task do not regenerate the subtask every frame.
+### LeRobot v3 subtask data support
 
-Key files:
-
-- `src/openpi/models/pi0.py`
-- `src/openpi/policies/policy.py`
-
-### 4. Training and Smoke-Test Configs
-
-This fork adds configs for subtask training and inference experiments.
-
-Important configs:
-
-- `pi05_subtask_libero`
-- `pi05_subtask_libero_infer`
-- `pi05_subtask_pickup_round1_50ep_lora`
-- `debug_pi05_subtask`
-
-The pickup LoRA config is intended as a small smoke-test style setup for
-checking that subtask generation can be trained and visualized before scaling up.
-
-Key file:
-
-- `src/openpi/training/config.py`
-
-### 5. Subtask Validation and Visualization Scripts
-
-This fork adds helper scripts for checking subtask predictions on real dataset
-samples and rendering visual summaries.
-
-Scripts:
-
-- `scripts/validate_subtask_on_dataset.py`
-- `scripts/visualize_subtask_predictions.py`
-- `scripts/visualize_subtask_episode_timeline.py`
-- `scripts/visualize_subtask_prediction_video.py`
-
-These scripts load a trained subtask checkpoint, run `generate_subtask()`, and
-save text/image/video views of predicted subtasks.
-
-## Dataset Format
-
-The base dataset format is still LeRobot.
-
-For standard OpenPI training, each frame or episode provides:
-
-```text
-image / video observations
-state
-actions
-task_index -> meta/tasks.parquet
-```
-
-For true subtask training, the dataset should also provide:
+This fork supports frame-level subtask supervision in LeRobot-style datasets.
+Subtask labels can be present directly as a `subtask` column, or indirectly via:
 
 ```text
 subtask_index -> meta/subtasks.parquet
@@ -158,90 +140,104 @@ Recommended structure:
 dataset/
   data/
     chunk-000/
-      file-000.parquet          # includes subtask_index per frame
+      file-000.parquet          # frame rows with state, action, task/subtask indices
   meta/
     info.json
     stats.json
     tasks.parquet               # task_index -> task text
     subtasks.parquet            # subtask_index -> subtask text
-    subtask_segments.csv        # optional human-readable segment summary
-    episodes/
-      chunk-000/
-        file-000.parquet
+    subtask_segments.csv        # optional annotation/debug summary
   videos/
     ...
 ```
 
-Example labels:
+Example subtask labels:
 
 ```text
-Task: Pick up the yellow camera and put it in the box.
+Task: pull the red phone out from the right side of the tray and insert it into the left side
 
 Subtasks:
-  move the gripper to the yellow camera
-  grasp the yellow camera
-  move the yellow camera toward the box
-  place the yellow camera in the box
-  release the yellow camera and move away
+  move the gripper to the red phone
+  grasp the red phone
+  pull the red phone out from the right side of the tray
+  move the red phone toward the left side of the tray
+  insert the red phone into the left side of the tray and release
 ```
 
-## Current Important Caveat
+## Important Configs and Scripts
 
-The current `TokenizeSubtaskTraining` implementation still defaults to identity
-subtask supervision:
+Configs:
 
-```python
-high_prompt = prompt
-low_prompt = prompt
+- `pi05_subtask_libero`
+- `pi05_subtask_libero_infer`
+- `pi05_subtask_pickup_round1_50ep_lora`
+- `debug_pi05_subtask`
+
+Scripts:
+
+- [scripts/validate_subtask_on_dataset.py](scripts/validate_subtask_on_dataset.py)
+- [scripts/visualize_subtask_predictions.py](scripts/visualize_subtask_predictions.py)
+- [scripts/visualize_subtask_episode_timeline.py](scripts/visualize_subtask_episode_timeline.py)
+- [scripts/visualize_subtask_prediction_video.py](scripts/visualize_subtask_prediction_video.py)
+- [scripts/plot_action_predictions_on_dataset.py](scripts/plot_action_predictions_on_dataset.py)
+
+`validate_subtask_on_dataset.py` reports whether generation hit `max_tokens`, which
+helps distinguish true model early-stop errors from text truncation.
+
+## Environment
+
+For Linux/CUDA machines, use the provided Conda environment:
+
+```bash
+conda env create -f environment-openpi-jax.yml
+conda activate openpi-jax
 ```
 
-That is enough to smoke-test the model path, loss, checkpointing, and inference
-scripts, but it is not yet full real subtask supervision.
+Or install with uv:
 
-To train on real subtask labels, add a data transform that maps:
-
-```text
-subtask_index -> meta/subtasks.parquet -> data["subtask"]
+```bash
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-Then change `TokenizeSubtaskTraining` to consume:
+The pinned JAX dependency uses CUDA 12 wheels. On macOS, full `uv run pytest` may
+fail during dependency resolution because `jax-cuda12-plugin` does not publish a
+macOS arm64 wheel.
 
-```python
-high_prompt = data.pop("prompt")
-low_prompt = data.pop("subtask")
-```
+## Typical Workflow
 
-## Suggested Development Flow
+1. Start from an OpenPI/LeRobot dataset.
+2. Add frame-level `subtask` or `subtask_index` annotations.
+3. Compute normalization stats.
+4. Fine-tune a pi0.5 subtask config.
+5. Validate generated subtasks.
+6. Render prediction videos and action plots.
 
-1. Create or collect a small LeRobot dataset.
-2. Add `subtask_index` and `meta/subtasks.parquet`.
-3. Validate that the dataset loads and that each frame has both task and subtask labels.
-4. Train a short LoRA smoke-test run with `Pi05SubtaskConfig`.
-5. Run the visualization scripts to inspect generated subtasks.
-6. Only then scale to more episodes or longer training.
+Example commands:
 
-For the current robot-pickup experiments, the intended direction is:
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_subtask_pickup_round1_50ep_lora
 
-```text
-Evo-RL data collection
--> value model / progress scoring
--> subtask annotation
--> OpenPI-subtask fine-tuning
--> rollout and visualization
+uv run scripts/train.py pi05_subtask_pickup_round1_50ep_lora \
+  --exp-name=subtask_smoke \
+  --overwrite
+
+uv run scripts/validate_subtask_on_dataset.py \
+  --config-name pi05_subtask_pickup_round1_50ep_lora \
+  --checkpoint-dir checkpoints/pi05_subtask_pickup_round1_50ep_lora/subtask_smoke
+
+uv run scripts/visualize_subtask_prediction_video.py \
+  --config-name pi05_subtask_pickup_round1_50ep_lora \
+  --checkpoint-dir checkpoints/pi05_subtask_pickup_round1_50ep_lora/subtask_smoke \
+  --output outputs/subtask_success_segment.mp4
 ```
 
 ## Relationship to Upstream OpenPI
 
-This repository keeps the upstream OpenPI model and training stack as the base.
-Most existing OpenPI configs, policies, and examples are still present. The main
-fork-specific work is isolated around:
+This repository keeps the upstream OpenPI model/training stack as the base.
+Most existing OpenPI configs, policies, and examples remain present. The fork
+mainly changes the pi0.5 subtask path, tokenizer/transforms, LeRobot subtask
+loading, two-stage inference, validation, and visualization tooling.
 
-- subtask tokenizer paths
-- `PI05_SUBTASK`
-- subtask CE loss
-- two-stage inference
-- subtask smoke-test configs
-- subtask prediction visualizers
-
-For upstream installation, checkpoints, base model notes, and general OpenPI
-usage, see [README_OPENPI.md](README_OPENPI.md).
+For base OpenPI installation, checkpoints, model notes, and examples, see
+[README_OPENPI.md](README_OPENPI.md).
