@@ -344,9 +344,11 @@ class TokenizeSubtaskInference(DataTransformFn):
             raise ValueError("Prompt is required for subtask inference")
         if not isinstance(prompt, str):
             prompt = prompt.item()
+        subtask = data.pop("subtask", None)
+        if subtask is not None and not isinstance(subtask, str):
+            subtask = subtask.item()
         data.pop("task", None)
         data.pop("task_index", None)
-        data.pop("subtask", None)
         data.pop("subtask_index", None)
 
         if self.discrete_state_input:
@@ -354,6 +356,22 @@ class TokenizeSubtaskInference(DataTransformFn):
                 raise ValueError("State is required.")
         else:
             state = None
+
+        if subtask:
+            tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(
+                prompt, subtask, state=state
+            )
+            out = {
+                **data,
+                "tokenized_prompt": tokens,
+                "tokenized_prompt_mask": mask,
+                "token_ar_mask": ar_mask,
+                "token_loss_mask": loss_mask,
+            }
+            if self.mask_task_from_action:
+                task_len = self.tokenizer.highlevel_task_token_len(prompt, state=state)
+                out["token_highlevel_mask"] = np.arange(len(tokens)) < task_len
+            return out
 
         tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt, state=state)
         out = {

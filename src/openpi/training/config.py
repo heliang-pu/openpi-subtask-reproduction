@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -90,6 +91,9 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Optional LeRobot episode subset. Useful for quick single-task fine-tuning on a local multi-task dataset.
+    episodes: Sequence[int] | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -436,6 +440,199 @@ class SingleArmCameraBoxOutputs(_transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class DoublePiperInputs(_transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        first_person = _parse_single_arm_image(data["observation/first_person"])
+        left_hand = _parse_single_arm_image(data["observation/left_hand"])
+        right_hand = _parse_single_arm_image(data["observation/right_hand"])
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": first_person,
+                "left_wrist_0_rgb": left_hand,
+                "right_wrist_0_rgb": right_hand,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        if "subtask" in data:
+            inputs["subtask"] = data["subtask"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class DoublePiperOutputs(_transforms.DataTransformFn):
+    action_dim: int = 12
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotDoublePiperDataConfig(DataConfigFactory):
+    first_person_image_key: str = "observation.images.first_person"
+    left_hand_image_key: str = "observation.images.left_hand"
+    right_hand_image_key: str = "observation.images.right_hand"
+    action_sequence_keys: Sequence[str] = ("action",)
+    output_action_dim: int = 12
+    subtask_inference: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/first_person": self.first_person_image_key,
+                        "observation/left_hand": self.left_hand_image_key,
+                        "observation/right_hand": self.right_hand_image_key,
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "subtask": "subtask",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[DoublePiperInputs()],
+            outputs=[DoublePiperOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.subtask_inference:
+            model_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeSubtaskInference(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ],
+            )
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class HuichuanFlexibleRepack(_transforms.DataTransformFn):
+    """Tolerant repack for Huichuan: maps only the source keys that exist.
+
+    Lets one config serve datasets with 1 camera (mock: top only) or
+    3 cameras (real robot: top + left_wrist + right_wrist).
+    """
+
+    structure: dict
+
+    def __call__(self, data: dict) -> dict:
+        out = {}
+        for new_key, old_key in self.structure.items():
+            if old_key in data:
+                out[new_key] = data[old_key]
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class HuichuanInputs(_transforms.DataTransformFn):
+    """Huichuan dual-arm inputs: state (14 eef / 16 joint) + up to 3 cameras."""
+
+    def __call__(self, data: dict) -> dict:
+        base = _parse_single_arm_image(data["observation/top"])
+        left = data.get("observation/left_wrist")
+        right = data.get("observation/right_wrist")
+        left = _parse_single_arm_image(left) if left is not None else np.zeros_like(base)
+        right = _parse_single_arm_image(right) if right is not None else np.zeros_like(base)
+
+        inputs = {
+            "state": np.asarray(data["observation/state"], dtype=np.float32),
+            "image": {
+                "base_0_rgb": base,
+                "left_wrist_0_rgb": left,
+                "right_wrist_0_rgb": right,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.bool_("observation/left_wrist" in data),
+                "right_wrist_0_rgb": np.bool_("observation/right_wrist" in data),
+            },
+        }
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class HuichuanOutputs(_transforms.DataTransformFn):
+    action_dim: int = 14  # eef=14, joint=16
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotHuichuanDataConfig(DataConfigFactory):
+    """Huichuan dual-arm (INBC SDK) dataset config.
+
+    Single-space datasets produced by split_dataset_actions.py:
+      eef   -> state/action 14 dims, output_action_dim=14
+      joint -> state/action 16 dims, output_action_dim=16
+    """
+
+    top_image_key: str = "observation.images.top"
+    left_wrist_image_key: str = "observation.images.left_wrist"
+    right_wrist_image_key: str = "observation.images.right_wrist"
+    action_sequence_keys: Sequence[str] = ("action",)
+    output_action_dim: int = 14
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                HuichuanFlexibleRepack(
+                    {
+                        "observation/top": self.top_image_key,
+                        "observation/left_wrist": self.left_wrist_image_key,
+                        "observation/right_wrist": self.right_wrist_image_key,
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[HuichuanInputs()],
+            outputs=[HuichuanOutputs(action_dim=self.output_action_dim)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotSingleArmDataConfig(DataConfigFactory):
     image_key: str = "observation.images.top"
     wrist_image_key: str = "observation.images.left_wrist"
@@ -463,6 +660,113 @@ class LeRobotSingleArmDataConfig(DataConfigFactory):
             inputs=[SingleArmCameraBoxInputs(model_type=model_config.model_type)],
             outputs=[SingleArmCameraBoxOutputs(action_dim=self.output_action_dim)],
         )
+        if self.subtask_inference:
+            model_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeSubtaskInference(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ],
+            )
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class G1LocoManipInputs(_transforms.DataTransformFn):
+    model_type: _model.ModelType
+    state_start: int = 12
+    state_end: int = 43
+    action_start: int = 12
+    action_end: int = 43
+    subtask_boundaries: tuple[int, ...] = (225, 450, 675)
+    subtasks: tuple[str, ...] = (
+        "navigate to the shelf and reach for the brown box",
+        "grasp and lift the brown box from the shelf",
+        "carry the brown box toward the blue bin",
+        "place the brown box into the blue bin",
+    )
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_single_arm_image(data["observation/image"])
+        frame_index = int(np.asarray(data.get("frame_index", 0)).item())
+        subtask_index = int(np.searchsorted(np.asarray(self.subtask_boundaries), frame_index, side="right"))
+        subtask = self.subtasks[min(subtask_index, len(self.subtasks) - 1)]
+
+        inputs = {
+            "state": np.asarray(data["observation/state"])[self.state_start : self.state_end],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": np.zeros_like(base_image),
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.False_,
+                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            },
+            "subtask": data.get("subtask", np.asarray(subtask)),
+        }
+        if "actions" in data:
+            inputs["actions"] = np.asarray(data["actions"])[:, self.action_start : self.action_end]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class G1LocoManipOutputs(_transforms.DataTransformFn):
+    action_dim: int = 31
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotG1LocoManipDataConfig(DataConfigFactory):
+    image_key: str = "observation.images.ego_view"
+    action_sequence_keys: Sequence[str] = ("action",)
+    output_action_dim: int = 31
+    use_delta_joint_actions: bool = True
+    subtask_inference: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": self.image_key,
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "frame_index": "frame_index",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[G1LocoManipInputs(model_type=model_config.model_type)],
+            outputs=[G1LocoManipOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(self.output_action_dim)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
         if self.subtask_inference:
             model_transforms = _transforms.Group(
                 inputs=[
@@ -645,6 +949,8 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Maximum number of recent checkpoints to keep.
+    max_checkpoints: int = 1
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = None
 
@@ -958,7 +1264,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
         ),
         freeze_filter=pi0_config.Pi05SubtaskConfig(
             paligemma_variant="gemma_2b_lora",
@@ -994,7 +1300,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
         ),
         freeze_filter=pi0_config.Pi05SubtaskConfig(
             paligemma_variant="gemma_2b_lora",
@@ -1028,12 +1334,12 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=100,
             peak_lr=1e-5,
-            decay_steps=3_000,
+            decay_steps=10_000,
             decay_lr=1e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
         ),
         ema_decay=None,
         num_train_steps=3_000,
@@ -1061,7 +1367,402 @@ _CONFIGS = [
             subtask_inference=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    #
+    # Huichuan dual-arm (INBC SDK) fine-tuning configs.
+    # 数据集用 split_dataset_actions.py 拆出的单一空间集；换真实数据时 CLI 覆盖:
+    #   --data.repo-id <id> --data.local-root <path>
+    #
+    TrainConfig(
+        name="pi05_huichuan_eef",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotHuichuanDataConfig(
+            repo_id="local/v",
+            local_root="/root/huichuan_setup/v_full-eef",
+            output_action_dim=14,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=1e-5, decay_steps=30_000, decay_lr=1e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        num_train_steps=30_000,
+        log_interval=10,
+        save_interval=5_000,
+        max_checkpoints=3,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_huichuan_joint",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotHuichuanDataConfig(
+            repo_id="local/v",
+            local_root="/root/huichuan_setup/v_full-joint",
+            output_action_dim=16,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=1e-5, decay_steps=30_000, decay_lr=1e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        num_train_steps=30_000,
+        log_interval=10,
+        save_interval=5_000,
+        max_checkpoints=3,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_coarse_full",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_coarse_grained",
+            local_root="/workspace/dataset/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_coarse_grained",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        num_train_steps=135_000,
+        log_interval=10,
+        save_interval=20_000,
+        max_checkpoints=3,
+        keep_period=None,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_coarse_full_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_coarse_grained",
+            local_root="/workspace/dataset/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_coarse_grained",
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_fine_task0",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_fine_grained_task0",
+            local_root="/workspace/dataset/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_fine_grained",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(50)),
+            ),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/shared/openpi-subtask/checkpoints/pi05_subtask_double_piper_libero_long_coarse_full/"
+            "double_piper_long_coarse_pi05_full_b16_until_0629_1000_keep3/40000/params"
+        ),
+        ema_decay=None,
+        num_train_steps=10_000,
+        log_interval=10,
+        save_interval=1000,
+        max_checkpoints=3,
+        keep_period=None,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_fine_task0_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_fine_grained_task0",
+            local_root="/workspace/dataset/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_fine_grained",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(50)),
+            ),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/shared/openpi-subtask/checkpoints/pi05_subtask_double_piper_libero_long_coarse_full/"
+            "double_piper_long_coarse_pi05_full_b16_until_0629_1000_keep3/40000/params"
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_nas_sim_full",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_nas_sim",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/shared/openpi-subtask/checkpoints/pi05_subtask_double_piper_libero_long_coarse_full/"
+            "double_piper_long_coarse_pi05_full_b16_until_0629_1000_keep3/40000/params"
+        ),
+        ema_decay=None,
+        num_train_steps=20_000,
+        log_interval=10,
+        save_interval=500,
+        max_checkpoints=6,
+        keep_period=5000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_nas_sim_base_full",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_nas_sim",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask",
+            assets=AssetsConfig(
+                assets_dir="/workspace/shared/openpi-subtask/assets/pi05_subtask_double_piper_libero_long_nas_sim_full",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        num_train_steps=100_000,
+        log_interval=10,
+        save_interval=500,
+        max_checkpoints=6,
+        keep_period=5000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_nas_sim_full_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_nas_sim",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask",
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/shared/openpi-subtask/checkpoints/pi05_subtask_double_piper_libero_long_coarse_full/"
+            "double_piper_long_coarse_pi05_full_b16_until_0629_1000_keep3/40000/params"
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_double_piper_libero_long_nas_sim_base_full_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask_nas_sim",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/sim/Lightwheel-Tasks-Double-Piper-LIBERO-Long_subtask",
+            assets=AssetsConfig(
+                assets_dir="/workspace/shared/openpi-subtask/assets/pi05_subtask_double_piper_libero_long_nas_sim_full",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_g1_loco_manip_31d_lora",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotG1LocoManipDataConfig(
+            repo_id="Arena-G1-Loco-Manipulation-Task",
+            local_root="/workspace/shared/openpi-subtask/.codex/datasets/Arena-G1-Loco-Manipulation-Task-v20-compat",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(8)),
+            ),
+        ),
+        batch_size=1,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5,
+            peak_lr=5e-5,
+            decay_steps=50,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=20,
+        log_interval=1,
+        save_interval=20,
+        max_checkpoints=1,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_g1_loco_manip_31d_lora_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotG1LocoManipDataConfig(
+            repo_id="Arena-G1-Loco-Manipulation-Task",
+            local_root="/workspace/shared/openpi-subtask/.codex/datasets/Arena-G1-Loco-Manipulation-Task-v20-compat",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(8)),
+            ),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    # G1 controller (5 tasks, both grippers), fine subtask, FULL fine-tune.
+    # Reuses the DoublePiper data pipeline: identical 3-camera keys
+    # (first_person/left_hand/right_hand) + subtask passthrough. Only the action
+    # dim differs -> G1 action is 19-dim (base 3 + dual-arm pose pos+quat + 2 grippers).
+    TrainConfig(
+        name="pi05_subtask_g1_5tasks_bothgripper_fine_full",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-G1-Controller-5Tasks_subtask_fine_bothgripper",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/LightwheelAI/Lightwheel-Tasks-G1-Controller-5Tasks_subtask_fine_bothgripper",
+            output_action_dim=19,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
+        ),
+        ema_decay=None,
+        num_train_steps=100_000,
+        log_interval=10,
+        save_interval=1000,
+        max_checkpoints=3,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_subtask_g1_5tasks_bothgripper_fine_full_infer",
+        model=pi0_config.Pi05SubtaskConfig(
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=LeRobotDoublePiperDataConfig(
+            repo_id="Lightwheel-Tasks-G1-Controller-5Tasks_subtask_fine_bothgripper",
+            local_root="/mnt/FermiBotNas/huggingface/datasets/LightwheelAI/Lightwheel-Tasks-G1-Controller-5Tasks_subtask_fine_bothgripper",
+            output_action_dim=19,
+            base_config=DataConfig(prompt_from_task=True),
+            subtask_inference=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
         ),
         ema_decay=None,
         wandb_enabled=False,
@@ -1083,7 +1784,7 @@ _CONFIGS = [
             subtask_inference=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/models/openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get("PI05_BASE_PARAMS", "/workspace/models/openpi-assets/checkpoints/pi05_base/params")
         ),
         freeze_filter=pi0_config.Pi05SubtaskConfig(
             paligemma_variant="gemma_2b_lora",

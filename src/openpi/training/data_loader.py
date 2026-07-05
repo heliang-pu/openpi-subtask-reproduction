@@ -67,6 +67,28 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class EpisodeSubset(Dataset[T_co]):
+    """Subset a LeRobot dataset by episode_index after local parquet files are loaded."""
+
+    def __init__(self, dataset: Dataset, episodes: Sequence[int]):
+        self._dataset = dataset
+        requested = {int(ep) for ep in episodes}
+        episode_indices = getattr(dataset, "hf_dataset")["episode_index"]
+        self._indices = [
+            idx
+            for idx, ep_idx in enumerate(episode_indices)
+            if int(ep_idx.item() if hasattr(ep_idx, "item") else ep_idx) in requested
+        ]
+        if not self._indices:
+            raise ValueError(f"No frames found for requested episodes: {sorted(requested)}")
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -177,11 +199,14 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, **dataset_kwargs)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
         **dataset_kwargs,
     )
+    if data_config.episodes is not None:
+        dataset = EpisodeSubset(dataset, data_config.episodes)
 
     metadata_transforms = []
     if subtask_mapping := load_lerobot_subtask_mapping(dataset_meta):
